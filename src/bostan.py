@@ -111,7 +111,15 @@ def credential_url(path):
 
 
 def spool_bytes(root):
-    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            # The independent publisher may remove a verified file during this scan.
+            continue
+    return total
 
 
 def space_ok(c):

@@ -188,6 +188,19 @@ class SafetyTests(unittest.TestCase):
             self.request()
         self.assertEqual(list(self.library.rglob("*.mkv")), [])
 
+    def test_concurrent_verified_cleanup_during_space_scan(self):
+        c, victim = self.queue()
+        original = Path.is_file
+
+        def cleanup(path):
+            if path == victim:
+                victim.unlink(missing_ok=True)
+                return True
+            return original(path)
+
+        with patch.object(Path, "is_file", cleanup):
+            self.assertGreaterEqual(b.spool_bytes(Path(c["spool"])), 0)
+
     def test_storage_guard(self):
         c, p = self.queue()
         c["reserve_bytes"] = 10**18
