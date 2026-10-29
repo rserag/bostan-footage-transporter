@@ -1,0 +1,13 @@
+{
+  "spool": "/var/lib/bostan",
+  "camera_name": "My camera",
+  "timezone": "UTC",
+  "segment_seconds": 3600,
+  "reserve_bytes": 2147483648,
+  "max_spool_bytes": 8589934592,
+  "grace_seconds": 7200,
+  "publish_interval": 60,
+  "ssh_key": "/var/lib/bostan/.ssh/id_ed25519",
+  "known_hosts": "/etc/bostan/known_hosts",
+  "destination": "bostan-ingest@media-server.example"
+}

@@ -1,0 +1,23 @@
+[Unit]
+Description=Local camera recording
+Wants=network-online.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=0
+[Service]
+User=bostan
+Group=bostan
+ExecStart=/usr/bin/python3 /opt/bostan/bostan.py record --config /etc/bostan/pi.json
+LoadCredential=camera.env:/etc/camera-recorder/camera.env
+Restart=always
+RestartSec=10
+TimeoutStopSec=180
+KillMode=mixed
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bostan
+MemoryMax=160M
+[Install]
+WantedBy=multi-user.target

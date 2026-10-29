@@ -1,0 +1,12 @@
+.private/
+images/
+provisioning/
+SETUP.txt
+__pycache__/
+*.pyc
+.venv/
+*.env
+*.mkv
+*.mp4
+*.ts
+*.log

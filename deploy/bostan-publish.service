@@ -1,0 +1,21 @@
+[Unit]
+Description=Verified camera recording uploads
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+[Service]
+User=bostan
+Group=bostan
+ExecStart=/usr/bin/python3 /opt/bostan/bostan.py publish --config /etc/bostan/pi.json
+Restart=always
+RestartSec=15
+TimeoutStopSec=90
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bostan
+MemoryMax=128M
+[Install]
+WantedBy=multi-user.target
