@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -103,6 +104,16 @@ class SafetyTests(unittest.TestCase):
             self.request(body=self.content[:100])
         self.assertEqual(list(self.library.rglob("*.mkv")), [])
         self.assertTrue(b.receipt_matches(self.request(), self.m))
+
+    def test_lost_commit_receipt_retry(self):
+        ack = self.request()
+        with contextlib.closing(
+            sqlite3.connect(Path(self.c["state"]) / "receipts.sqlite3")
+        ) as db:
+            db.execute("UPDATE recordings SET committed=0")
+            db.commit()
+        self.assertEqual(self.request(), ack)
+        self.assertEqual(len(list(self.library.rglob("*.mkv"))), 1)
 
     def test_hash_mismatch_retains_no_published_video(self):
         m = copy.deepcopy(self.m)

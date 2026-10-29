@@ -442,6 +442,7 @@ def receive(c, input_stream=sys.stdin.buffer):
             remaining = m["size"]
             with temp_video.open("wb") as f:
                 while remaining:
+                    signal.alarm(c.get("receive_idle_timeout", 0))
                     block = input_stream.read(min(1024 * 1024, remaining))
                     if not block:
                         raise ValueError("interrupted upload")
@@ -667,6 +668,13 @@ def main():
     elif args.mode == "publish":
         publish(c)
     else:
+
+        def idle_timeout(*_):
+            raise TimeoutError("receiver idle timeout")
+
+        signal.signal(signal.SIGALRM, idle_timeout)
+        c.setdefault("receive_idle_timeout", 120)
+        signal.alarm(c["receive_idle_timeout"])
         try:
             receive(c)
         except Exception as exc:

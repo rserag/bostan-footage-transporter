@@ -16,7 +16,9 @@ ARMv6 Pi Zero W: video and audio are copied without re-encoding.
   times are recorder-side estimates, not authenticated camera timestamps. The
   camera and recorder clocks must be configured correctly; NTP is recommended.
 - A locked-down SSH receiver accepts only this protocol, not arbitrary commands,
-  SFTP, tunnels, or an interactive shell. Pin its host key before use.
+  SFTP, tunnels, or an interactive shell. A two-minute receive-idle timeout
+  releases abandoned transfers so a disconnected SSH session cannot hold the
+  receiver lock indefinitely. Pin its host key before use.
 - Hidden staging, SHA-256 verification, ffprobe validation, file/directory fsync,
   and atomic video publication precede the durable receipt. Metadata sidecars are
   made durable before the video is exposed to the library. State and media
@@ -81,9 +83,9 @@ My camera/
   tvshow.nfo
   Season 01/
     season.nfo
-    S01E01 - YYYY-MM-DD HH-MM-SS - identifier.mkv
-    S01E01 - YYYY-MM-DD HH-MM-SS - identifier.json
-    S01E01 - YYYY-MM-DD HH-MM-SS - identifier.nfo
+    Recording - S01E01 - YYYY-MM-DD HH-MM-SS - identifier.mkv
+    Recording - S01E01 - YYYY-MM-DD HH-MM-SS - identifier.json
+    Recording - S01E01 - YYYY-MM-DD HH-MM-SS - identifier.nfo
 ```
 
 The original compressed media bytes are preserved on the server. Container
