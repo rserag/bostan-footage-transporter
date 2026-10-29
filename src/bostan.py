@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import resource
 import shutil
 import signal
 import stat
@@ -64,13 +65,17 @@ def syncdir(path):
 
 def atomic_json(path, obj):
     path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    syncdir(path.parent)
+    tmp = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o666)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        syncdir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def digest(path):
@@ -82,23 +87,27 @@ def digest(path):
 
 
 def probe(path, binary="ffprobe"):
-    p = subprocess.run(
-        [
-            binary,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration,size:stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
-            "-of",
-            "json",
-            str(path),
-        ],
-        capture_output=True,
-        timeout=90,
-    )
-    if p.returncode:
-        raise ValueError("media probe failed")
-    data = json.loads(p.stdout)
+    # Damaged media may make probe diagnostics/metadata grow without bound.
+    # Use an unnamed file and a child-only output cap, never a buffered pipe.
+    # A tiny exec wrapper avoids preexec_fn in the recorder's threaded process.
+    wrapper = ("import os,resource,sys; h=resource.getrlimit(resource.RLIMIT_FSIZE)[1]; "
+               "n=65536 if h==resource.RLIM_INFINITY else min(65536,h); "
+               "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
+               "resource.setrlimit(resource.RLIMIT_FSIZE,(n,n)); os.execvp(sys.argv[1],sys.argv[1:])")
+    with tempfile.TemporaryFile() as output:
+        p = subprocess.run(
+            [sys.executable, "-c", wrapper, binary, "-v", "error", "-show_entries",
+             "format=duration,size:stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+             "-of", "json", str(path)],
+            stdout=output, stderr=subprocess.DEVNULL, timeout=90,
+        )
+        if p.returncode:
+            raise ValueError("media probe failed")
+        output.seek(0)
+        encoded = output.read(65537)
+    if len(encoded) > 65536:
+        raise ValueError("oversize media probe")
+    data = json.loads(encoded)
     duration = float(data.get("format", {}).get("duration", 0))
     if not 0 < duration < 172800 or not any(
         s["codec_type"] == "video" for s in data["streams"]
@@ -131,10 +140,14 @@ def credential_url(path):
 
 def spool_bytes(root):
     total = 0
+    seen = set()
     for path in root.rglob("*"):
         try:
-            if path.is_file():
-                total += path.stat().st_size
+            s = path.lstat()
+            inode = (s.st_dev, s.st_ino)
+            if stat.S_ISREG(s.st_mode) and inode not in seen:
+                total += s.st_size
+                seen.add(inode)
         except FileNotFoundError:
             # The independent publisher may remove a verified file during this scan.
             continue
@@ -149,13 +162,19 @@ def space_ok(c):
     )
 
 
-def finalize(c, raw, reason):
+def recording_id(raw):
+    ident = raw.stem if raw.parent.name == "ready" else raw.parent.name + "-" + raw.stem
+    if not re.fullmatch(r"[a-f0-9]{32}-\d{8}T\d{6}Z", ident):
+        raise ValueError("invalid recording filename")
+    dt.datetime.strptime(ident.rsplit("-", 1)[1], "%Y%m%dT%H%M%SZ")
+    return ident
+
+
+def manifest_for(c, raw, ident, reason):
+    if not stat.S_ISREG(raw.lstat().st_mode):
+        raise ValueError("not regular media")
     data, duration = probe(raw)
-    start = dt.datetime.strptime(raw.stem, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-    ident = raw.parent.name + "-" + raw.stem
-    ready = Path(c["spool"]) / "ready"
-    ready.mkdir(exist_ok=True)
-    target = ready / (ident + ".mkv")
+    start = dt.datetime.strptime(ident.rsplit("-", 1)[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
     m = dict(
         id=ident,
         start_utc=start.isoformat(),
@@ -172,190 +191,468 @@ def finalize(c, raw, reason):
         size=raw.stat().st_size,
         sha256=digest(raw),
     )
+    check_manifest(m)
+    return m
+
+
+def exclusive_json(path, obj):
+    """Publish durable metadata without replacing any existing evidence."""
+    name = path.parent / (".seal-" + uuid.uuid4().hex)
+    # Match normal umask/group permissions so the restricted read-only monitor
+    # can inspect sealed manifests; mkstemp's 0600 would hide them from it.
+    fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o666)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(obj, out, sort_keys=True, indent=2)
+            out.flush()
+            os.fsync(out.fileno())
+        os.link(name, path)
+        syncdir(path.parent)
+    finally:
+        os.unlink(name)
+
+
+def seal(c, raw, m):
+    """Video first, manifest last; retries may complete but never replace a seal."""
+    ready = Path(c["spool"]) / "ready"
+    ready.mkdir(exist_ok=True)
+    target = ready / (m["id"] + ".mkv")
     with raw.open("rb") as f:
         os.fsync(f.fileno())
-    os.replace(raw, target)
+    try:
+        os.link(raw, target)
+    except FileExistsError:
+        if (not stat.S_ISREG(target.lstat().st_mode) or target.stat().st_size != m["size"]
+                or digest(target) != m["sha256"]):
+            raise ValueError("sealed video conflict") from None
     syncdir(ready)
-    atomic_json(ready / (ident + ".json"), m)
-    LOG.info("sealed recording %s duration=%.1fs", ident, duration)
+    manifest = target.with_suffix(".json")
+    try:
+        exclusive_json(manifest, m)
+    except FileExistsError:
+        saved = check_manifest(read_regular_json(manifest))
+        if any(saved.get(k) != m[k] for k in ("id", "size", "sha256", "start_utc", "end_utc")):
+            raise ValueError("sealed manifest conflict") from None
+    syncdir(ready)
+
+
+def finalize(c, raw, reason):
+    m = manifest_for(c, raw, recording_id(raw), reason)
+    seal(c, raw, m)
+    raw.unlink()
+    syncdir(raw.parent)
+    LOG.info("sealed recording %s duration=%.1fs", m["id"], m["duration_seconds"])
+
+
+def recovery_key(entry):
+    return hashlib.sha256(os.fsencode(str(entry))).hexdigest()
+
+
+def recovery_path(c, entry):
+    return Path(c["spool"]) / "recovery" / (recovery_key(entry) + ".json")
+
+
+def capture_protocol_ready(root):
+    """An upgrade must never mistake a legacy recorder's live file for an orphan."""
+    def held(path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return False
+        with os.fdopen(fd, "rb") as lock:
+            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+                raise ValueError("invalid recorder lock")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+
+    return not held(root / "recorder.lock") or held(root / "recovery-aware.lock")
+
+
+def load_recovery(path):
+    if not path.exists() and not path.is_symlink():
+        return None
+    s = read_regular_json(path)
+    if (not isinstance(s, dict) or s.get("version") != 1
+            or s.get("status") not in ("running", "backoff", "quarantined", "recovered")
+            or type(s.get("attempts")) is not int or not 0 <= s["attempts"] <= 100
+            or not isinstance(s.get("entry"), str)
+            or recovery_key(s["entry"]) != path.stem
+            or s.get("reason") not in ("interrupted", "failed", "timeout", "space", "artifact", "recovered")
+            or any(type(s.get(k)) not in (int, float) or not math.isfinite(s[k])
+                   for k in ("last_attempt", "next_attempt"))
+            or not 0 <= s["next_attempt"] - s["last_attempt"] <= 21600):
+        raise ValueError("invalid recovery state")
+    return s
+
+
+def recovery_entry(c, entry):
+    """Only exact, regular files beneath real spool directories are media inputs."""
+    parts = Path(entry).parts
+    if (len(parts) not in (2, 3) or parts[0] not in ("active", "ready")
+            or (parts[0] == "active") != (len(parts) == 3) or any(p in (".", "..") for p in parts)):
+        raise ValueError("invalid recovery entry")
+    root = Path(c["spool"])
+    raw = root / entry
+    for parent in raw.parents:
+        if parent == root:
+            break
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise ValueError("invalid media directory")
+    if raw.suffix != ".mkv" or not stat.S_ISREG(raw.lstat().st_mode):
+        raise ValueError("invalid media entry")
+    return raw, recording_id(raw)
+
+
+@contextlib.contextmanager
+def recovery_run_lock(c, ident):
+    run = Path(c["spool"]) / "active" / ident.split("-", 1)[0]
+    if not run.exists():
+        yield
+        return
+    if not stat.S_ISDIR(run.lstat().st_mode):
+        raise ValueError("invalid run directory")
+    fd = os.open(run / "capture.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640)
+    with os.fdopen(fd, "a+b") as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            raise ValueError("invalid capture lock")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def recovery_candidates(root):
+    # Include legacy partial artifacts and malformed/nonregular entries. They get
+    # an observable hold, never an attempt to interpret their names as a clock.
+    for run in (root / "active").iterdir():
+        if stat.S_ISDIR(run.lstat().st_mode):
+            for raw in run.iterdir():
+                if raw.name not in ("session.json", "capture.lock"):
+                    yield raw.relative_to(root)
+        else:
+            yield run.relative_to(root)
+    for raw in (root / "ready").iterdir():
+        if ((raw.suffix == ".mkv" and not os.path.lexists(raw.with_suffix(".json")))
+                or raw.suffix not in (".mkv", ".json")):
+            if raw.suffix == ".mkv" or time.time() - raw.lstat().st_mtime > 300:
+                yield raw.relative_to(root)
+
+
+def stop_recovery_child(p):
+    # All media tools inherit this private process group. Kill descendants even
+    # when the direct child has already exited. Never wait without a bound.
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(p.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        p.wait(timeout=2)
+
+
+def recovery_spawn(c, entry, output_limit, timeout):
+    request = json.dumps(dict(config=c, entry=str(entry), output_limit=output_limit)).encode()
+    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_recover-one"],
+                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        p.communicate(request, timeout=timeout)
+        return "recovered" if p.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    finally:
+        stop_recovery_child(p)
+
+
+def recover_one(c, entry, output_limit):
+    """Run only in a disposable child: probe, remux, hash and fsync share its limit."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
+    raw, ident = recovery_entry(c, entry)
+    state_path = recovery_path(c, entry)
+    with recovery_run_lock(c, ident):
+        s = load_recovery(state_path)
+        if not s or s["status"] != "running":
+            raise ValueError("attempt not reserved")
+        root = Path(c["spool"])
+        work = root / "recovery" / "work" / state_path.stem
+        work.mkdir(exist_ok=True)
+        if not stat.S_ISDIR(work.lstat().st_mode):
+            raise ValueError("invalid recovery work directory")
+        commit = work / "commit.json"
+        if os.path.lexists(commit):
+            job = read_regular_json(commit)
+            m = check_manifest(job["manifest"])
+            if m["id"] != ident or not re.fullmatch(r"attempt-[1-9][0-9]*\.mkv", job["output"]):
+                raise ValueError("invalid recovery commit")
+            fixed = work / job["output"]
+            if (not stat.S_ISREG(fixed.lstat().st_mode) or fixed.stat().st_size != m["size"]
+                    or digest(fixed) != m["sha256"]):
+                raise ValueError("recovery output changed")
+        elif (raw.parent.name == "ready" or
+              (root / "ready" / (ident + ".mkv")).exists()):
+            # A video linked before its manifest already passed normal close.
+            # Preserve those exact bytes; a damaged ready orphan stays held.
+            fixed = root / "ready" / (ident + ".mkv")
+            if raw != fixed and not os.path.samefile(raw, fixed):
+                raise ValueError("sealed video conflict")
+            m = manifest_for(c, fixed, ident, "recovered_after_restart")
+        else:
+            fixed = work / ("attempt-" + str(s["attempts"]) + ".mkv")
+            result = subprocess.run([
+                "ffmpeg", "-nostdin", "-v", "error", "-i", str(raw),
+                "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-f", "matroska", "-n", str(fixed),
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
+            if result.returncode:
+                raise ValueError("remux failed")
+            m = manifest_for(c, fixed, ident, "recovered_after_restart")
+            with fixed.open("rb") as source:
+                os.fsync(source.fileno())
+            syncdir(work)
+            exclusive_json(commit, dict(output=fixed.name, manifest=m))
+        seal(c, fixed, m)
+        # Active originals and all failed outputs stay in place. A durable success
+        # marker prevents their replay even after publisher grace cleanup.
+        atomic_json(state_path, dict(s, status="recovered", reason="recovered"))
 
 
 def recover(c):
+    """Independent, globally bounded pass; never called by the capture loop."""
     root = Path(c["spool"])
-    # A crash between moving a video and writing its manifest is also recoverable.
-    for raw in (root / "ready").glob("*.mkv"):
-        if not raw.with_suffix(".json").exists():
-            ident, stamp = raw.stem.rsplit("-", 1)
-            dest = root / "active" / ident
-            dest.mkdir(exist_ok=True)
-            os.replace(raw, dest / (stamp + ".mkv"))
-    for raw in (root / "active").glob("*/*.mkv"):
-        fixed = raw.with_suffix(".recovering")
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-v",
-                "error",
-                "-i",
-                str(raw),
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-c",
-                "copy",
-                "-f",
-                "matroska",
-                "-y",
-                str(fixed),
-            ],
-            capture_output=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
+    result = dict(attempted=0, recovered=0, quarantined=0)
+    budget = min(240, max(0.1, c.get("recovery_budget_seconds", 240)))
+    deadline = time.monotonic() + budget
+    for name in ("active", "ready", "recovery", "recovery/work"):
+        directory = root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        if not stat.S_ISDIR(directory.lstat().st_mode):
+            raise ValueError("invalid recovery directory")
+    fd = os.open(root / "recovery.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640)
+    with os.fdopen(fd, "a+b") as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            raise ValueError("invalid recovery lock")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return result
+        if not capture_protocol_ready(root):
+            LOG.warning("recovery held reason=legacy_recorder; capture retains ownership")
+            return result
+        service = root / "recovery" / "service.json"
+        current = time.time()
+        if os.path.lexists(service):
+            saved = read_regular_json(service)
+            if (not isinstance(saved, dict) or saved.get("version") != 1
+                    or any(type(saved.get(k)) not in (int, float) or not math.isfinite(saved[k])
+                           for k in ("last_attempt", "next_attempt"))
+                    or not 0 <= saved["next_attempt"] - saved["last_attempt"] <= 300):
+                raise ValueError("invalid recovery pass state")
+            if saved["last_attempt"] <= current < saved["next_attempt"]:
+                return result
+        # Persist before scanning/spawning: reconnect, boot or a crash cannot
+        # reset the shared five-minute ceiling. Corrupt state requires an operator.
+        atomic_json(service, dict(version=1, last_attempt=current, next_attempt=current + 300))
+        for entry in recovery_candidates(root):
+            if STOP.is_set() or time.monotonic() >= deadline or result["attempted"] >= 2:
+                break
+            state_path = recovery_path(c, entry)
             try:
-                probe(fixed)
-                os.replace(fixed, raw)
-                finalize(c, raw, "recovered_after_restart")
-            except ValueError:
-                LOG.error("unrecoverable recording retained: %s", raw.name)
-        else:
-            LOG.error("damaged recording retained: %s", raw.name)
-        fixed.unlink(missing_ok=True)
+                s = load_recovery(state_path)
+                if s and (s["status"] in ("quarantined", "recovered")
+                          or s["last_attempt"] <= current < s["next_attempt"]):
+                    continue
+                attempts = s["attempts"] if s else 0
+                if attempts >= 3:
+                    atomic_json(state_path, dict(s, status="quarantined"))
+                    continue
+                try:
+                    raw, ident = recovery_entry(c, entry)
+                    with recovery_run_lock(c, ident):
+                        pass
+                except BlockingIOError:
+                    continue  # Recorder owns the entire run until close/finalize.
+                except (ValueError, OSError):
+                    atomic_json(state_path, dict(version=1, entry=str(entry), attempts=attempts,
+                        status="quarantined", reason="artifact", last_attempt=current, next_attempt=current))
+                    result["quarantined"] += 1
+                    LOG.warning("recovery held reason=artifact entry=%s; footage retained", state_path.stem)
+                    continue
+                size = raw.stat().st_size
+                output_limit = min(c.get("recovery_max_output_bytes", 512 * 1024**2),
+                                   size + max(1024**2, size // 20))
+                available = min(shutil.disk_usage(root).free - c.get("reserve_bytes", 0),
+                                c.get("max_spool_bytes", 8 * 1024**3) - spool_bytes(root))
+                enough = output_limit + 64 * 1024**2 < available
+                s = dict(version=1, entry=str(entry), attempts=attempts + int(enough),
+                         status="running" if enough else "backoff", reason="interrupted" if enough else "space",
+                         last_attempt=current, next_attempt=current + min(21600, 300 * 2**min(attempts, 6)))
+                atomic_json(state_path, s)
+                if not enough:
+                    LOG.warning("recovery deferred reason=space entry=%s; footage retained", state_path.stem)
+                    continue
+                result["attempted"] += 1
+                reason = recovery_spawn(c, entry, output_limit,
+                    max(0.01, deadline - time.monotonic()))
+                saved = load_recovery(state_path)
+                if saved["status"] == "recovered":
+                    result["recovered"] += 1
+                    LOG.info("recovery completed entry=%s; original retained", state_path.stem)
+                else:
+                    held = s["attempts"] >= 3
+                    atomic_json(state_path, dict(s, status="quarantined" if held else "backoff", reason=reason))
+                    result["quarantined"] += int(held)
+                    LOG.warning("recovery deferred reason=%s entry=%s attempts=%d; footage retained",
+                                reason, state_path.stem, s["attempts"])
+            except Exception:
+                # An unreadable state or filesystem error is a hold, never a
+                # reason to retry without a durable reservation or touch capture.
+                LOG.warning("recovery state/io hold entry=%s; footage retained", state_path.stem)
+    return result
+
+
+def record_connection(c, url, run):
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        "15000000",
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_format",
+        "matroska",
+        "-segment_format_options",
+        "cluster_time_limit=5000",
+        "-segment_time",
+        str(c["segment_seconds"]),
+        "-segment_atclocktime",
+        "1",
+        "-reset_timestamps",
+        "1",
+        "-strftime",
+        "1",
+        "-segment_list",
+        "pipe:1",
+        "-segment_list_type",
+        "csv",
+        str(run / "%Y%m%dT%H%M%SZ.mkv"),
+    ]
+    env = dict(os.environ, TZ="UTC")
+    # FFmpeg stderr can contain the credential URL: never forward it to journals.
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        text=True,
+    )
+    try:
+        events = queue.Queue()
+
+        def reader():
+            for row in csv.reader(p.stdout):
+                if row:
+                    events.put(row[0])
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        last_change = time.monotonic()
+        last_size = -1
+        reason = "hour_boundary"
+        while p.poll() is None:
+            while not events.empty():
+                raw = run / Path(events.get()).name
+                try:
+                    finalize(c, raw, "hour_boundary")
+                except Exception:
+                    LOG.warning(
+                        "invalid closed segment retained; capture continues"
+                    )
+            size = sum(f.stat().st_size for f in run.glob("*.mkv"))
+            if size != last_size:
+                last_size = size
+                last_change = time.monotonic()
+            if (
+                STOP.is_set()
+                or not space_ok(c)
+                or time.monotonic() - last_change > 60
+            ):
+                reason = (
+                    "shutdown" if STOP.is_set() else "storage_guard_or_stream_stall"
+                )
+                p.send_signal(signal.SIGINT)
+                try:
+                    p.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=2)
+                break
+            STOP.wait(2)
+        thread.join(timeout=5)
+        if reason == "hour_boundary":
+            reason = "stream_ended"
+        while not events.empty():
+            raw = run / Path(events.get()).name
+            if raw.exists():
+                try:
+                    finalize(c, raw, reason)
+                except Exception:
+                    LOG.warning("incomplete segment retained for recovery")
+    finally:
+        if p.poll() is None:
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=2)
+        p.stdout.close()
 
 
 def record(c, credentials):
     root = Path(c["spool"])
     for name in ("active", "ready", "receipts"):
         (root / name).mkdir(parents=True, exist_ok=True)
-    with (root / "recorder.lock").open("w") as lock:
+    with ((root / "recorder.lock").open("w") as lock,
+          (root / "recovery-aware.lock").open("a+b") as protocol_lock):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        recover(c)
+        fcntl.flock(protocol_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         url = credential_url(credentials)
         while not STOP.is_set():
             if not space_ok(c):
-                LOG.warning(
-                    "storage guard: recording paused; unverified footage retained"
-                )
+                LOG.warning("storage guard: recording paused; unverified footage retained")
                 STOP.wait(30)
                 continue
             run = root / "active" / uuid.uuid4().hex
             run.mkdir()
-            atomic_json(
-                run / "session.json",
-                {
+            # Recovery takes the same lock before looking at any file in a run.
+            with (run / "capture.lock").open("a+b") as capture_lock:
+                fcntl.flock(capture_lock, fcntl.LOCK_EX)
+                atomic_json(run / "session.json", {
                     "started_utc": now(),
-                    "boot_id": Path("/proc/sys/kernel/random/boot_id")
-                    .read_text()
-                    .strip()
-                    if Path("/proc/sys/kernel/random/boot_id").exists()
-                    else "test",
-                },
-            )
-            cmd = [
-                "ffmpeg",
-                "-nostdin",
-                "-hide_banner",
-                "-v",
-                "error",
-                "-rtsp_transport",
-                "tcp",
-                "-timeout",
-                "15000000",
-                "-i",
-                url,
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-c",
-                "copy",
-                "-f",
-                "segment",
-                "-segment_format",
-                "matroska",
-                "-segment_format_options",
-                "cluster_time_limit=5000",
-                "-segment_time",
-                str(c["segment_seconds"]),
-                "-segment_atclocktime",
-                "1",
-                "-reset_timestamps",
-                "1",
-                "-strftime",
-                "1",
-                "-segment_list",
-                "pipe:1",
-                "-segment_list_type",
-                "csv",
-                str(run / "%Y%m%dT%H%M%SZ.mkv"),
-            ]
-            env = dict(os.environ, TZ="UTC")
-            # FFmpeg stderr can contain the credential URL: never forward it to journals.
-            p = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=env,
-                text=True,
-            )
-            events = queue.Queue()
-
-            def reader():
-                for row in csv.reader(p.stdout):
-                    if row:
-                        events.put(row[0])
-
-            thread = threading.Thread(target=reader, daemon=True)
-            thread.start()
-            last_change = time.monotonic()
-            last_size = -1
-            reason = "hour_boundary"
-            while p.poll() is None:
-                while not events.empty():
-                    raw = run / Path(events.get()).name
-                    try:
-                        finalize(c, raw, "hour_boundary")
-                    except (ValueError, FileNotFoundError, subprocess.TimeoutExpired):
-                        LOG.warning(
-                            "invalid closed segment retained; capture continues"
-                        )
-                size = sum(f.stat().st_size for f in run.glob("*.mkv"))
-                if size != last_size:
-                    last_size = size
-                    last_change = time.monotonic()
-                if (
-                    STOP.is_set()
-                    or not space_ok(c)
-                    or time.monotonic() - last_change > 60
-                ):
-                    reason = (
-                        "shutdown" if STOP.is_set() else "storage_guard_or_stream_stall"
-                    )
-                    p.send_signal(signal.SIGINT)
-                    try:
-                        p.wait(timeout=20)
-                    except subprocess.TimeoutExpired:
-                        p.kill()
-                        p.wait()
-                    break
-                STOP.wait(2)
-            thread.join(timeout=5)
-            if reason == "hour_boundary":
-                reason = "stream_ended"
-            while not events.empty():
-                raw = run / Path(events.get()).name
-                if raw.exists():
-                    try:
-                        finalize(c, raw, reason)
-                    except ValueError:
-                        LOG.warning("incomplete segment retained for recovery")
-            recover(c)
-            if not list(run.glob("*.mkv")):
+                    "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                    if Path("/proc/sys/kernel/random/boot_id").exists() else "test",
+                })
+                try:
+                    record_connection(c, url, run)
+                except Exception:
+                    LOG.warning("capture connection failed; closed footage retained")
+            # Do not remove a run that contains any footage or partial artifacts.
+            if all(p.name in ("session.json", "capture.lock") for p in run.iterdir()):
                 shutil.rmtree(run)
             LOG.info("capture connection ended; reconnecting")
             STOP.wait(5)
+
 
 
 def xml_file(path, tag, values):
@@ -879,8 +1176,8 @@ def publish(c):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["record", "publish", "receive"])
-    parser.add_argument("--config", required=True)
+    parser.add_argument("mode", choices=["record", "publish", "receive", "recover", "_recover-one"])
+    parser.add_argument("--config")
     parser.add_argument("--credentials")
     args = parser.parse_args()
     logging.basicConfig(
@@ -888,6 +1185,12 @@ def main():
     )
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    if args.mode == "_recover-one":
+        request = json.loads(sys.stdin.buffer.read(65537))
+        recover_one(request["config"], request["entry"], request["output_limit"])
+        return
+    if not args.config:
+        parser.error("--config is required")
     c = json.loads(Path(args.config).read_text())
     if args.mode == "record":
         record(
@@ -895,6 +1198,12 @@ def main():
             args.credentials
             or str(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "camera.env"),
         )
+    elif args.mode == "recover":
+        try:
+            print(json.dumps(recover(c)))
+        except Exception:
+            LOG.error("recovery pass held reason=state_io; footage retained")
+            sys.exit(1)
     elif args.mode == "publish":
         publish(c)
     else:

@@ -50,7 +50,12 @@ outage duration or a prediction of future bitrate.
 The publisher's [durable item retries](upload-retries.md) keep failed footage in
 `ready/`. Item retry markers also count as invalid queue entries, exposing local
 hash and remote verification failures without hashing videos in the probe.
-Malformed/missing video or receipt metadata remains visible. Shared service
+The [recovery worker](recording-recovery.md) also exposes running/failed/quarantined
+items through this alert, with separate held/recovered/retained-byte metrics.
+Retained originals and partial outputs reduce capacity; hard links count once.
+Historical recovery originals are excluded from current-capture growth/closure
+checks after a scheduling marker exists. Malformed/missing video or receipt
+metadata remains visible. Shared service
 backoff uses existing reachability/backlog checks rather than falsely labeling
 every queued recording corrupt. Retry and held-file bytes stay in the buffer
 estimate; publisher changes do not reset the collector's incident state.

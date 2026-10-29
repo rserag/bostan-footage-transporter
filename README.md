@@ -34,9 +34,11 @@ ARMv6 Pi Zero W: video and audio are copied without re-encoding.
 - Unverified footage is never automatically evicted. Recording pauses below the
   free-space reserve or above the spool limit, then resumes after space returns.
   While paused, or while the camera is offline, new footage cannot be captured.
-- On recorder restart, incomplete MKV files are remuxed and salvaged where
-  possible. Unsalvageable files are retained for inspection. Sudden power loss
-  can still lose buffered packets; this is not a forensic or lossless NVR.
+- Capture starts independently of historical recovery. A separate bounded
+  worker salvages interrupted MKVs with durable attempt limits and indefinite
+  holds. Originals and partial outputs are retained for inspection, including
+  after successful remux. Sudden power loss can still lose buffered packets;
+  this is not a forensic or lossless NVR.
 
 The default spool ceiling is 8 GiB with a 2 GiB OS reserve. Measure actual camera
 bitrate before sizing the outage buffer. Continuous recording writes to the SD
@@ -69,7 +71,7 @@ recommended between recorder and receiver. Configure it independently.
    Verify its fingerprint and write a standard known-hosts entry to
    `/etc/bostan/known_hosts` (readable by `bostan`). Do not disable host-key checks.
    Set `destination` in the Pi config to `bostan-ingest@YOUR_SERVER`.
-6. Run `sudo systemctl enable --now bostan-record bostan-publish`.
+6. Run `sudo systemctl enable --now bostan-record bostan-publish bostan-recover.timer`.
 7. Enable Jellyfin real-time monitoring on the existing TV library, or arrange a
    periodic library refresh. The transport receipt confirms durable server files;
    it does not wait for Jellyfin's asynchronous indexing. Local NFO files provide
@@ -113,7 +115,9 @@ independent backup. No server-side retention/deletion policy is applied.
 If uploads are deferred, inspect connectivity, disk capacity and the receiver.
 If one recording is corrupt, it is retained while healthy later items continue.
 See [upload retries and repair](docs/upload-retries.md) for the durable retry
-state, outage behavior and operator recovery. Recorder FFmpeg stderr is suppressed
+state, outage behavior and operator recovery. See [recording recovery](docs/recording-recovery.md)
+for process/disk limits, original retention, quarantine repair and deployment.
+Recorder FFmpeg stderr is suppressed
 because it may contain the credential URL; journals contain only generic capture
 status. Do not publish raw process listings or credential files.
 

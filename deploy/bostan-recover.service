@@ -1,0 +1,20 @@
+[Unit]
+Description=Bounded recovery of closed camera recordings
+After=bostan-record.service
+
+[Service]
+Type=oneshot
+User=bostan
+Group=bostan
+ExecStart=/usr/bin/python3 /opt/bostan/bostan.py recover --config /etc/bostan/pi.json
+TimeoutStartSec=260
+TimeoutStopSec=3
+KillMode=control-group
+Nice=15
+IOSchedulingClass=idle
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bostan

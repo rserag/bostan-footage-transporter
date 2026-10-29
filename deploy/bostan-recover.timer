@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry closed camera recording recovery in bounded passes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30
+Unit=bostan-recover.service
+
+[Install]
+WantedBy=timers.target

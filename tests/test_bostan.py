@@ -551,7 +551,8 @@ class SafetyTests(unittest.TestCase):
         (run / "20261029T120000Z.mkv").write_bytes(self.content)
         b.recover(c)
         self.assertEqual(len(list((root / "ready").glob("*.json"))), 1)
-        self.assertEqual(list(run.glob("*.mkv")), [])
+        # A salvage does not prove the remux preserved every recoverable packet.
+        self.assertEqual((run / "20261029T120000Z.mkv").read_bytes(), self.content)
 
 
 if __name__ == "__main__":

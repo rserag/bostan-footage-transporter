@@ -6,7 +6,8 @@ invalid IDs, mismatched filenames, missing videos, changed local bytes and bad
 saved receipts defer only that item. The other recordings continue to upload
 and clean up after their normal verified-copy grace period. Videos without a
 manifest remain retained and are reported by monitoring after its orphan grace;
-the publisher does not invent their metadata. Recorder recovery is separate.
+the publisher does not invent their metadata. See [bounded recorder recovery](recording-recovery.md)
+for its separate worker, attempt limits and retained originals.
 
 Failed items remain in `ready/`; they are never automatically moved or deleted.
 This is an in-place hold with automatic retries, rather than a permanent
@@ -84,8 +85,9 @@ blocking the queue forever; a subsequent result repairs/clears its schedule.
 Neither kind of scheduling metadata can authorize deletion. Obsolete item
 markers with no remaining manifest are pruned; footage and receipts are not.
 
-No new server retention policy, permanent quarantine, recorder recovery change,
-network timeout policy or watchdog setting is introduced. Retained failures
+The upload scheduler introduces no server retention policy, permanent upload
+quarantine, network timeout policy or watchdog setting. Recorder recovery has
+its own [bounded worker and holds](recording-recovery.md). Retained failures
 still consume finite storage and can eventually pause recording at the existing
 storage guard; an operator must repair them or arrange safe extra storage.
 

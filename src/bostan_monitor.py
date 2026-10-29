@@ -35,7 +35,7 @@ def timestamp(value):
 
 
 def token(value):
-    return hashlib.sha256(str(value).encode()).hexdigest()
+    return hashlib.sha256(os.fsencode(str(value))).hexdigest()
 
 
 def load(path):
@@ -77,7 +77,8 @@ def regular_files(root, pattern):
     """Ignore normal publisher/finalizer races; never traverse symbolic links."""
     for path in root.glob(pattern):
         try:
-            if not path.is_symlink() and path.is_file():
+            if (not path.is_symlink() and path.is_file()
+                    and all(not p.is_symlink() for p in path.parents if p != root and root in p.parents)):
                 yield path, path.stat()
         except FileNotFoundError:
             continue
@@ -98,19 +99,66 @@ def probe_pi(c, clock=time.time, services=service_status):
     active = list(regular_files(root, "active/*/*.mkv"))
     ready = list(regular_files(root, "ready/*.mkv"))
     total = 0
+    seen = set()
     for directory, children, files in os.walk(root, followlinks=False):
         children[:] = [name for name in children if not name.startswith(".")
                        and not (Path(directory) / name).is_symlink()]
         for name in files:
             try:
                 path = Path(directory) / name
-                if not path.is_symlink():
-                    total += path.stat().st_size
+                s = path.lstat()
+                inode = (s.st_dev, s.st_ino)
+                if stat.S_ISREG(s.st_mode) and inode not in seen:
+                    total += s.st_size
+                    seen.add(inode)
             except FileNotFoundError:
                 continue
-    latest = max(active, key=lambda entry: entry[1].st_mtime, default=None)
     pending, rates, closes = [], [], []
     invalid = 0
+    held, recovered, retained_bytes, excluded = 0, 0, 0, set()
+    for path in (root / "recovery").glob("*.json"):
+        try:
+            s = load_queue_json(path)
+            if path.name == "service.json":
+                if (s.get("version") != 1 or any(type(s.get(k)) not in (int, float)
+                        or not math.isfinite(s[k]) for k in ("last_attempt", "next_attempt"))
+                        or not 0 <= s["next_attempt"] - s["last_attempt"] <= 300):
+                    raise ValueError("invalid recovery pass")
+                continue
+            entry = Path(s["entry"])
+            if (s.get("version") != 1 or entry.is_absolute() or ".." in entry.parts
+                    or s.get("status") not in ("running", "backoff", "quarantined", "recovered")
+                    or type(s.get("attempts")) is not int or not 0 <= s["attempts"] <= 100
+                    or s.get("reason") not in ("interrupted", "failed", "timeout", "space", "artifact", "recovered")
+                    or any(type(s.get(k)) not in (int, float) or not math.isfinite(s[k])
+                           for k in ("last_attempt", "next_attempt"))
+                    or not 0 <= s["next_attempt"] - s["last_attempt"] <= 21600
+                    or hashlib.sha256(os.fsencode(str(entry))).hexdigest() != path.stem):
+                raise ValueError("invalid recovery entry")
+            if s["status"] == "recovered":
+                recovered += 1
+            else:
+                held += 1
+                invalid += 1
+            # Held/recovered originals are not the currently growing capture.
+            # Their presence remains visible through holds and capacity metrics.
+            if len(entry.parts) == 3 and entry.parts[0] == "active":
+                excluded.add(entry)
+                with contextlib.suppress(FileNotFoundError):
+                    retained_bytes += (root / entry).lstat().st_size
+        except FileNotFoundError:
+            continue
+        except (ValueError, KeyError, TypeError, AttributeError, OSError):
+            held += 1
+            invalid += 1
+    for work in (root / "recovery" / "work").glob("*"):
+        # An interrupted output whose scheduling metadata went missing must not
+        # disappear from fault visibility even if its input has also disappeared.
+        if not (root / "recovery" / (work.name + ".json")).exists():
+            held += 1
+            invalid += 1
+    active = [(p, s) for p, s in active if p.relative_to(root) not in excluded]
+    latest = max(active, key=lambda entry: entry[1].st_mtime, default=None)
     for path in (root / "ready").glob("*.json"):
         try:
             m = load_queue_json(path)
@@ -194,7 +242,7 @@ def probe_pi(c, clock=time.time, services=service_status):
     orphan = sum(1 for p, s in ready
                  if current - s.st_mtime > 300 and not p.with_suffix(".json").exists())
     starts = []
-    for path, stat in active:
+    for path, s in active:
         try:
             starts.append(dt.datetime.strptime(path.stem, "%Y%m%dT%H%M%SZ")
                           .replace(tzinfo=dt.timezone.utc).timestamp())
@@ -217,6 +265,7 @@ def probe_pi(c, clock=time.time, services=service_status):
         recent_bytes_per_second=statistics.median(
             rate for _, rate in sorted(rates)[-6:]) if rates else 0,
         invalid_entries=invalid + orphan,
+        recovery_held=held, recovery_recovered=recovered, recovery_retained_bytes=retained_bytes,
     )
 
 
@@ -371,6 +420,9 @@ def evaluate(c, state, pi, server, indexed, current):
                        pi_oldest_active_age_seconds=max(0, pi["timestamp"] - pi["oldest_active_start"]),
                        pi_latest_closed_age_seconds=max(0, pi["timestamp"] - pi["latest_closed"]),
                        pi_invalid_entries=pi["invalid_entries"],
+                       pi_recovery_held=pi.get("recovery_held", 0),
+                       pi_recovery_recovered=pi.get("recovery_recovered", 0),
+                       pi_recovery_retained_bytes=pi.get("recovery_retained_bytes", 0),
                        pi_record_up=pi["record_up"], pi_publish_up=pi["publish_up"])
     if server is not None:
         offsets.append(abs(current - server["timestamp"]))

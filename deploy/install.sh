@@ -20,6 +20,7 @@ if [[ $role == pi ]]; then
         runuser -u bostan -- ssh-keygen -q -t ed25519 -N '' -f /var/lib/bostan/.ssh/id_ed25519
     fi
     install -m 0644 deploy/bostan-{record,publish}.service /etc/systemd/system/
+    install -m 0644 deploy/bostan-recover.{service,timer} /etc/systemd/system/
     systemctl daemon-reload
     echo 'Code installed. Install camera credentials and pinned known_hosts before enabling services.'
 elif [[ $role == receiver ]]; then
