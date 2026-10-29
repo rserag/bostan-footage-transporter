@@ -1,7 +1,9 @@
 [Unit]
 Description=Local camera recording
-Wants=network-online.target
-After=network-online.target time-sync.target
+Wants=network-online.target systemd-timesyncd.service
+# The recorder implements its own bounded synchronization wait. Do not order it
+# after time-sync.target: an enabled infinite wait service could block capture.
+After=network-online.target systemd-timesyncd.service
 StartLimitIntervalSec=0
 [Service]
 User=bostan

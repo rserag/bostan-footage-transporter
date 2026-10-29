@@ -30,6 +30,7 @@ of healthy observations. There is no initial "healthy" notification.
 | Jellyfin unavailable | Authenticated read-only indexing query fails for 3 minutes | Check Jellyfin/API access; delivery may still work |
 | Jellyfin missing footage | Committed, present footage over 10 minutes old absent from index, for 2 minutes | Check mount, permissions and scan; compare archive first |
 | Archive assets missing | A committed video is absent/size changed, or JSON/NFO absent, for 2 minutes | Check storage/receipt ledger and documented deletions |
+| Clock uncertainty | Recorder reports uncertain/stale clock evidence for 2 minutes | Check NTP; uncertain footage remains captured without an assigned date |
 | Clock skew | Probe and monitor clocks differ by over 2 minutes, for 2 minutes | Check NTP; timing diagnostics may be inaccurate |
 
 No upstream response means dependent checks are **unknown**, not recovered.
@@ -191,5 +192,10 @@ This is availability monitoring, not a periodic content-integrity audit. File
 size and sidecar existence do not prove hashes, decodability, audio continuity
 or Jellyfin playback. A growing MKV also cannot prove a changing scene or every
 packet's capture. Transport's existing SHA verification still applies. Physical
-power/card repair, poison-entry isolation, bounded recovery, clock startup,
-backups, watchdog investigation and retention decisions are separate work.
+power/card repair, backups, watchdog investigation and retention decisions remain
+separate work. Upload isolation, bounded recovery and clock safety have their own
+runbooks and are independent of monitoring.
+
+Clock-aware capture, elapsed queue ages, incident timing continuity, new clock metrics
+and v1/v2 deployment compatibility are described in [clock safety](clock-safety.md).
+Preserve existing incident state when updating the collector.

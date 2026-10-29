@@ -53,6 +53,26 @@ def load_queue_json(path):
     return json.loads(data)
 
 
+def elapsed():
+    return time.clock_gettime(time.CLOCK_BOOTTIME) if hasattr(time, "CLOCK_BOOTTIME") else time.monotonic()
+
+
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "process-" + str(os.getpid())
+
+
+def elapsed_age(anchor):
+    if (not isinstance(anchor, dict) or not isinstance(anchor.get("boot_id"), str)
+            or any(type(anchor.get(k)) not in (int, float) or not math.isfinite(anchor[k]) or anchor[k] < 0
+                   for k in ("elapsed", "delay"))):
+        raise ValueError("invalid elapsed anchor")
+    tick = elapsed()
+    return tick - anchor["elapsed"] if anchor["boot_id"] == boot_id() and tick >= anchor["elapsed"] else None
+
+
 def atomic_write(path, text, mode=0o600):
     path = Path(path)
     fd, name = tempfile.mkstemp(prefix="." + path.name, dir=path.parent)
@@ -93,6 +113,21 @@ def service_status(unit):
     return int(values.get("ActiveState") == "active" and values.get("SubState") == "running")
 
 
+def live_run(run):
+    try:
+        fd = os.open(run / "capture.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as lock:
+            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+                return False
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def probe_pi(c, clock=time.time, services=service_status):
     current = clock()
     root = Path(c["spool"])
@@ -114,11 +149,22 @@ def probe_pi(c, clock=time.time, services=service_status):
             except FileNotFoundError:
                 continue
     pending, rates, closes = [], [], []
+    pending_entries, uncertain_count = [], 0
+    clock_status, clock_age = None, 0
+    if (root / "clock.json").exists():
+        try:
+            s = load_queue_json(root / "clock.json")
+            clock_age = elapsed_age(dict(s, delay=0))
+            clock_status = int(s["status"] == "synchronized" and clock_age is not None and clock_age < 90)
+        except (OSError, ValueError, TypeError, KeyError):
+            clock_status, clock_age = 0, None
     invalid = 0
     held, recovered, retained_bytes, excluded = 0, 0, 0, set()
     for path in (root / "recovery").glob("*.json"):
         try:
             s = load_queue_json(path)
+            if "timer" in s:
+                elapsed_age(s["timer"])
             if path.name == "service.json":
                 if (s.get("version") != 1 or any(type(s.get(k)) not in (int, float)
                         or not math.isfinite(s[k]) for k in ("last_attempt", "next_attempt"))
@@ -158,7 +204,10 @@ def probe_pi(c, clock=time.time, services=service_status):
             held += 1
             invalid += 1
     active = [(p, s) for p, s in active if p.relative_to(root) not in excluded]
-    latest = max(active, key=lambda entry: entry[1].st_mtime, default=None)
+    owners = {p.parent: live_run(p.parent) for p, _ in active}
+    latest = max(active, key=lambda entry: (owners[entry[0].parent],
+                 int(entry[0].stem[:10]) if re.fullmatch(r"[0-9]{10}-\d{8}T\d{6}Z", entry[0].stem)
+                 else entry[1].st_mtime), default=None)
     for path in (root / "ready").glob("*.json"):
         try:
             m = load_queue_json(path)
@@ -169,9 +218,19 @@ def probe_pi(c, clock=time.time, services=service_status):
                     or type(m["duration_seconds"]) not in (int, float)
                     or not 0 < m["duration_seconds"] < 172800):
                 raise ValueError("invalid manifest")
-            start, end = timestamp(m["start_utc"]), timestamp(m["end_utc"])
-            if end <= start:
-                raise ValueError("invalid time range")
+            version, evidence = m.get("manifest_version", 1), m.get("clock", {})
+            if (type(version) is not int or version not in (1, 2) or version == 2
+                    and (not isinstance(evidence, dict) or evidence.get("status") not in ("synchronized", "uncertain"))):
+                raise ValueError("invalid manifest clock shape")
+            uncertain = version == 2 and evidence["status"] == "uncertain"
+            if uncertain:
+                if m["start_utc"] is not None or m["end_utc"] is not None:
+                    raise ValueError("uncertain capture claims UTC")
+                uncertain_count += 1
+            else:
+                start, end = timestamp(m["start_utc"]), timestamp(m["end_utc"])
+                if end <= start:
+                    raise ValueError("invalid time range")
             closed = timestamp(m["closed_utc"])
             closes.append(closed)
             if m["duration_seconds"] > 10:
@@ -182,9 +241,11 @@ def probe_pi(c, clock=time.time, services=service_status):
                 try:
                     record = load_queue_json(receipt)
                     saved = record["receipt"]
+                    if "timer" in record:
+                        elapsed_age(record["timer"])
                     verified = record["verified_at"]
                     acknowledged = (type(verified) in (int, float) and math.isfinite(verified)
-                        and verified >= 0 and isinstance(saved, dict)
+                        and (verified >= 0 or "timer" in record) and isinstance(saved, dict)
                         and type(saved.get("size")) is int and saved.get("status") == "committed" and all(
                         saved.get(k) == m[k] for k in ("id", "size", "sha256")))
                 except (ValueError, KeyError, TypeError, OSError):
@@ -197,6 +258,8 @@ def probe_pi(c, clock=time.time, services=service_status):
                 invalid += 1
             if not acknowledged:
                 pending.append((closed, m["size"]))
+                age = elapsed_age(m["sealed_timer"]) if m.get("manifest_version") == 2 else max(0, current - closed)
+                pending_entries.append(dict(token=token(m["id"]), age_seconds=age))
         except FileNotFoundError:
             # Atomic cleanup may remove the manifest between listing and read.
             continue
@@ -205,6 +268,8 @@ def probe_pi(c, clock=time.time, services=service_status):
     for path in (root / "receipts").glob("*.json"):
         try:
             record = load_queue_json(path)
+            if "timer" in record:
+                elapsed_age(record["timer"])
             verified = record["verified_at"]
             receipt = record["receipt"]
             if (not isinstance(receipt, dict) or receipt.get("status") != "committed"
@@ -213,7 +278,8 @@ def probe_pi(c, clock=time.time, services=service_status):
                     or not re.fullmatch(r"[a-f0-9]{64}", receipt["sha256"])
                     or type(receipt["size"]) is not int or receipt["size"] <= 0):
                 raise ValueError("invalid receipt")
-            if type(verified) not in (int, float) or not math.isfinite(verified) or verified < 0:
+            if (type(verified) not in (int, float) or not math.isfinite(verified)
+                    or verified < 0 and "timer" not in record):
                 raise ValueError("invalid receipt time")
             closes.append(verified)
         except FileNotFoundError:
@@ -225,6 +291,8 @@ def probe_pi(c, clock=time.time, services=service_status):
     for path in (root / "retry").glob("*.json"):
         try:
             retry = load_queue_json(path)
+            if "timer" in retry:
+                elapsed_age(retry["timer"])
             if (path.name != "service.json" or retry["version"] != 1
                     or retry["reason"] != "service_unavailable"
                     or retry["signature"] != "service"
@@ -244,9 +312,16 @@ def probe_pi(c, clock=time.time, services=service_status):
     starts = []
     for path, s in active:
         try:
-            starts.append(dt.datetime.strptime(path.stem, "%Y%m%dT%H%M%SZ")
-                          .replace(tzinfo=dt.timezone.utc).timestamp())
-        except ValueError:
+            if re.fullmatch(r"[0-9]{10}-\d{8}T\d{6}Z", path.stem):
+                evidence = load_queue_json(path.with_suffix(".clock"))
+                age = elapsed_age(dict(boot_id=evidence["boot_id"], elapsed=evidence["open_elapsed"], delay=0))
+                starts.append(current - (age if age is not None else c["segment_seconds"] + 601))
+            else:
+                starts.append(dt.datetime.strptime(path.stem, "%Y%m%dT%H%M%SZ")
+                              .replace(tzinfo=dt.timezone.utc).timestamp())
+        except FileNotFoundError:
+            starts.append(current)  # File creation can precede its first observation by <1s.
+        except (ValueError, TypeError, KeyError, OSError):
             invalid += 1
     return dict(
         version=1, timestamp=current,
@@ -261,6 +336,8 @@ def probe_pi(c, clock=time.time, services=service_status):
         spool_bytes=total, free_bytes=shutil.disk_usage(root).free,
         reserve_bytes=c["reserve_bytes"], max_spool_bytes=c["max_spool_bytes"],
         pending_count=len(pending), pending_bytes=sum(size for _, size in pending),
+        pending_entries=pending_entries, timestamp_uncertain_count=uncertain_count,
+        clock_synchronized=clock_status, clock_observation_age_seconds=clock_age,
         oldest_pending=min((closed for closed, _ in pending), default=current),
         recent_bytes_per_second=statistics.median(
             rate for _, rate in sorted(rates)[-6:]) if rates else 0,
@@ -375,6 +452,8 @@ RULES = {
         "Inspect archive storage and receipt ledger; exclude only documented intentional deletions."),
     "clock_skew": (120, "warning", "A probe clock differs from the monitor by over 2 minutes",
         "Check NTP on Pi and server; timing and buffer diagnostics may be inaccurate."),
+    "clock_uncertain": (120, "warning", "Recorder time is uncertain or its clock observation is stale",
+        "Check NTP and clock observations. Capture continues; uncertain clips have no assigned capture date."),
 }
 
 
@@ -393,8 +472,10 @@ def evaluate(c, state, pi, server, indexed, current):
         previous = state.get("growth", {})
         last = previous.get("last", current - max(0, pi["timestamp"] - pi["active_mtime"])
                             if pi["active_mtime"] else current)
-        if (pi["active_bytes"] > 0 and (pi["active_token"] != previous.get("token")
-                or pi["active_bytes"] > previous.get("size", 0))):
+        if (pi["active_bytes"] > 0 and pi["active_token"] == previous.get("token")
+                and pi["active_bytes"] > previous.get("size", 0)):
+            last = current  # Actual byte growth remains evidence despite Pi clock steps.
+        elif pi["active_bytes"] > 0 and pi["active_token"] != previous.get("token"):
             # A newly observed stale file is not evidence of current growth.
             last = max(last, current - max(0, pi["timestamp"] - pi["active_mtime"]))
         state["growth"] = dict(token=pi["active_token"], size=pi["active_bytes"], last=last)
@@ -403,8 +484,16 @@ def evaluate(c, state, pi, server, indexed, current):
         conditions["late_segment"] = (pi["timestamp"] - pi["oldest_active_start"]
                                         > pi["segment_seconds"] + 600)
         backlog_age = max(0, pi["timestamp"] - pi["oldest_pending"]) if pi["pending_count"] else 0
+        if "pending_entries" in pi:
+            observed = state.get("pending_observations", {})
+            state["pending_observations"] = {e["token"]: observed.get(e["token"], current)
+                                             for e in pi["pending_entries"]}
+            backlog_age = max((max(e["age_seconds"] or 0,
+                current - state["pending_observations"][e["token"]]) for e in pi["pending_entries"]), default=0)
         conditions["upload_backlog"] = backlog_age > 900
         conditions["queue_invalid"] = pi["invalid_entries"] > 0
+        status = pi.get("clock_synchronized")
+        conditions["clock_uncertain"] = status != 1 if status is not None else None
         rate = max(c.get("fallback_bytes_per_second", 100000),
                    pi["recent_bytes_per_second"] * 1.2)
         available = max(0, min(pi["max_spool_bytes"] - pi["spool_bytes"],
@@ -424,6 +513,10 @@ def evaluate(c, state, pi, server, indexed, current):
                        pi_recovery_recovered=pi.get("recovery_recovered", 0),
                        pi_recovery_retained_bytes=pi.get("recovery_retained_bytes", 0),
                        pi_record_up=pi["record_up"], pi_publish_up=pi["publish_up"])
+        if status is not None:
+            metrics.update(pi_clock_synchronized=status,
+                           pi_clock_observation_age_seconds=pi.get("clock_observation_age_seconds") or 0,
+                           pi_timestamp_uncertain_count=pi.get("timestamp_uncertain_count", 0))
     if server is not None:
         offsets.append(abs(current - server["timestamp"]))
         conditions["archive_missing"] = server["missing_assets"] > 0
@@ -459,6 +552,24 @@ def advance(state, conditions, current, recovery_seconds=120):
             if current - alarm["healthy"] >= recovery_seconds:
                 alarm["active"] = False
     return alarms
+
+
+def stabilize(state, current):
+    """Keep incident ages across clock steps without clearing acknowledgements."""
+    tick = elapsed()
+    previous = state.get("elapsed_clock")
+    if previous:
+        same_boot = previous["boot_id"] == boot_id() and tick >= previous["elapsed"]
+        shift = current - (previous["wall"] + tick - previous["elapsed"]) if same_boot else 0
+        for alarm in state.get("alarms", {}).values():
+            for field in ("pending", "healthy", "retry_at"):
+                if field in alarm:
+                    alarm[field] = alarm[field] + shift if same_boot else current + (300 if field == "retry_at" else 0)
+        if "growth" in state:
+            state["growth"]["last"] = state["growth"]["last"] + shift if same_boot else current
+        for name, value in state.get("pending_observations", {}).items():
+            state["pending_observations"][name] = value + shift if same_boot else current
+    state["elapsed_clock"] = dict(boot_id=boot_id(), elapsed=tick, wall=current)
 
 
 def telegram(c, message):
@@ -537,6 +648,7 @@ def collect(c):
         except Exception:
             indexed = None
         current = time.time()
+        stabilize(state, current)
         conditions, metrics = evaluate(c, state, *samples, indexed, current)
         advance(state, conditions, current)
         save()

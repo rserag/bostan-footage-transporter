@@ -21,8 +21,8 @@ Restart the recorder before enabling its recovery timer.
 - The timer starts two minutes after boot, then five minutes after each completed
   pass, with up to 30 seconds of jitter. A durable `recovery/service.json` also
   prevents manual starts, service restarts or reboot from bypassing five minutes
-  between passes. A normal clock reversal permits one new pass, then persists
-  its new schedule; clock discipline is a separate operational requirement.
+  between passes. Boot/elapsed anchors ignore wall-clock steps. Reboot or legacy
+  wall-only state conservatively rebases the full five-minute delay once.
 - Each pass starts at most two media attempts and gives all attempts together
   240 seconds. One attempt can use that entire shared budget, including remux, probe,
   SHA-256, fsync and publication. Timed-out workers and their process-group
@@ -156,3 +156,9 @@ retained. Keep the new recorder source while investigating. Restoring an old
 recorder that retries every `active/*.mkv` would ignore success/hold markers and
 can restore the original blocking bug; first arrange safe, audited relocation
 of closed recovery originals. Never roll back data or delete receipt rows.
+
+Clock-safe numeric recordings keep their original run lock despite per-file UUIDs.
+Missing close/clock evidence stays uncertain during recovery; no capture date is
+inferred from recovery time. Delay state uses persisted boot/elapsed anchors,
+including a conservative full-delay rebase after reboot or legacy migration.
+See [clock safety](clock-safety.md) before upgrading or rolling back v2 recordings.

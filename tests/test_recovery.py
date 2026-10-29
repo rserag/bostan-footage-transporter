@@ -39,11 +39,15 @@ class RecoveryTests(unittest.TestCase):
         cls.fixtures.cleanup()
 
     def setUp(self):
+        self.addCleanup(patch.stopall)
+        patch.object(b, 'elapsed', side_effect=lambda: b.time.time()).start()
+        patch.object(b, 'ntp_observation', return_value=(False, None)).start()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.c = dict(spool=str(self.root / 'spool'), camera_name='Test', timezone='UTC',
-                      segment_seconds=3600, reserve_bytes=0, max_spool_bytes=10**9)
+                      segment_seconds=3600, reserve_bytes=0, max_spool_bytes=10**9,
+                      startup_sync_wait_seconds=0)
         self.spool = Path(self.c['spool'])
         for name in ('active', 'ready', 'receipts'):
             (self.spool / name).mkdir(parents=True)
@@ -273,7 +277,7 @@ b.recover_one(r['config'],r['entry'],r['output_limit'])
 
     def test_interrupted_seal_reuses_validated_output_without_overwrite(self):
         raw = self.raw()
-        code = "original=b.exclusive_json\ndef fail(path,obj):\n if path.parent.name=='ready': raise OSError('injected')\n return original(path,obj)\nb.exclusive_json=fail"
+        code = "original=b.exclusive_json\ndef fail(path,obj):\n if path.parent.name=='ready' and path.suffix=='.json': raise OSError('injected')\n return original(path,obj)\nb.exclusive_json=fail"
         with patch.object(b, 'recovery_spawn', side_effect=self.worker_with(code)):
             self.pass_at()
         video = next((self.spool / 'ready').glob('*.mkv'))
@@ -288,7 +292,12 @@ b.recover_one(r['config'],r['entry'],r['output_limit'])
 
     def test_interrupted_normal_finalization_retains_source_and_ready_orphan_completes(self):
         raw = self.raw()
-        with patch.object(b, 'exclusive_json', side_effect=OSError('injected')):
+        original = b.exclusive_json
+        def fail_manifest(path, value):
+            if path.suffix == '.json':
+                raise OSError('injected')
+            return original(path, value)
+        with patch.object(b, 'exclusive_json', side_effect=fail_manifest):
             with self.assertRaises(OSError):
                 b.finalize(self.c, raw, 'test')
         self.assertEqual(raw.read_bytes(), self.content)

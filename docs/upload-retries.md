@@ -1,7 +1,7 @@
 # Upload failure isolation and repair
 
 The publisher validates each `ready/*.json` independently before sorting valid
-entries by recording start time. Invalid JSON, non-UTC/invalid timestamps,
+entries by known recording start time (uncertain-time v2 entries remain valid). Invalid JSON, non-UTC/invalid timestamps,
 invalid IDs, mismatched filenames, missing videos, changed local bytes and bad
 saved receipts defer only that item. The other recordings continue to upload
 and clean up after their normal verified-copy grace period. Videos without a
@@ -17,7 +17,10 @@ reason code, failure count, last attempt, next attempt and file-stat signature
 contain no exception payload or arbitrary filename. Backoff is 60, 120, 240,
 480, 960, 1920, then 3600 seconds, capped at one hour, with no maximum attempt
 count. Actual attempts occur on publisher passes, so add up to
-`publish_interval` to these delays. The schedule survives service restarts.
+`publish_interval` to these delays. The schedule survives service restarts. Boot/elapsed anchors, rather than wall
+clock dates, determine expiry. A reboot or legacy wall-only state restarts the
+full delay once; clock steps cannot trigger retry storms or premature grace
+cleanup. See [clock safety](clock-safety.md) for migration and timestamp v2.
 
 A changed manifest, video or receipt stat signature makes an item eligible on
 the next pass, so a repair need not wait for its previous backoff. This signature

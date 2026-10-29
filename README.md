@@ -12,9 +12,11 @@ ARMv6 Pi Zero W: video and audio are copied without re-encoding.
   promised with stream copy. Original camera video/audio and on-screen overlays
   are preserved. No extra timestamp is burned into the video.
 - Every closed recording has a JSON manifest with SHA-256, stream information,
-  duration, UTC times, time zone, close reason, and partial status. Wall-clock
-  times are recorder-side estimates, not authenticated camera timestamps. The
-  camera and recorder clocks must be configured correctly; NTP is recommended.
+  duration, time quality, time zone, close reason, and partial status. Startup
+  waits briefly for NTP, then captures even if UTC remains uncertain. Synchronized
+  times are approximate recorder observations; uncertain capture UTC is null and
+  appears in a separate Time uncertain season. Clock steps close affected clips
+  safely; identities do not depend on wall time. See [clock safety](docs/clock-safety.md).
 - A locked-down SSH receiver accepts only this protocol, not arbitrary commands,
   SFTP, tunnels, or an interactive shell. A two-minute receive-idle timeout
   releases abandoned transfers so a disconnected SSH session cannot hold the
@@ -25,12 +27,15 @@ ARMv6 Pi Zero W: video and audio are copied without re-encoding.
   must be on the same filesystem. Interrupted transfers retry from the beginning.
 - Duplicate delivery is idempotent. Monthly seasons and sequential episode
   numbers are reserved in SQLite; each recording ID remains stable on retry.
+  Uncertain dates are never guessed from arrival time or retroactively relabeled.
 - One damaged manifest, recording or receipt does not block later recordings.
   Failed items stay in place with durable, capped retry backoff; a separate
   shared backoff limits attempts during network/server outages.
 - Local deletion requires the matching receipt, the retention grace period
   (default two hours), and a fresh remote rehash plus intact manifest/NFO.
-  Under storage pressure, already verified files can be removed sooner.
+  Grace and retry delays use persisted boot/elapsed timers, so clock jumps cannot
+  expire them. Reboot conservatively restarts the full grace. Under storage
+  pressure, already verified files can be removed sooner after fresh verification.
 - Unverified footage is never automatically evicted. Recording pauses below the
   free-space reserve or above the spool limit, then resumes after space returns.
   While paused, or while the camera is offline, new footage cannot be captured.

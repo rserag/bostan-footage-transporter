@@ -58,6 +58,10 @@ class SafetyTests(unittest.TestCase):
         cls.fixture.cleanup()
 
     def setUp(self):
+        # Existing scheduler scenarios advance a simulated elapsed clock together
+        # with wall time. Clock-step independence is tested in test_timestamps.py.
+        self.addCleanup(patch.stopall)
+        patch.object(b, "elapsed", side_effect=lambda: b.time.time()).start()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -347,6 +351,7 @@ class SafetyTests(unittest.TestCase):
         # Reloading the module simulates loss of all process-local retry state.
         fresh = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fresh)
+        patch.object(fresh, "elapsed", side_effect=lambda: fresh.time.time()).start()
         with patch.object(fresh.time, "time", return_value=1059), patch.object(fresh, "publish_item") as work:
             fresh.publish_once(c)
         work.assert_not_called()

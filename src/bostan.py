@@ -55,6 +55,195 @@ def now():
     return dt.datetime.now(UTC).isoformat()
 
 
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "process-" + str(os.getpid())  # Non-Linux tests; never infer reboot time.
+
+
+def elapsed():
+    # BOOTTIME also counts suspend. Wall-clock corrections never advance a lease.
+    return time.clock_gettime(time.CLOCK_BOOTTIME) if hasattr(time, "CLOCK_BOOTTIME") else time.monotonic()
+
+
+def timer_anchor(delay=0):
+    return dict(boot_id=boot_id(), elapsed=elapsed(), delay=delay)
+
+
+def check_timer(anchor):
+    if (not isinstance(anchor, dict) or not isinstance(anchor.get("boot_id"), str)
+            or any(type(anchor.get(k)) not in (int, float) or not math.isfinite(anchor[k])
+                   or anchor[k] < 0 for k in ("elapsed", "delay"))):
+        raise ValueError("invalid elapsed timer")
+    return anchor
+
+
+def remaining(path, saved, delay, current=None):
+    """Persist a conservative rebase once per boot/legacy upgrade, not per process."""
+    anchor = check_timer(saved["timer"]) if "timer" in saved else None
+    tick = elapsed()
+    if (not anchor or anchor["delay"] != delay or anchor["boot_id"] != boot_id()
+            or tick < anchor["elapsed"]):
+        saved["timer"] = timer_anchor(delay)
+        atomic_json(path, saved)
+        return delay
+    return max(0, delay - (tick - anchor["elapsed"]))
+
+
+def ntp_observation():
+    """Require current-boot timesyncd evidence AND the kernel synchronization flag."""
+    try:
+        s = Path("/run/systemd/timesync/synchronized").stat()
+        marker = "%d:%d:%d" % (s.st_dev, s.st_ino, s.st_mtime_ns)
+        if not -2 <= time.time() - s.st_mtime <= 7200:
+            return False, marker  # An old boot-local marker is not ongoing NTP evidence.
+    except OSError:
+        return False, None
+    try:
+        p = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                           capture_output=True, text=True, timeout=3)
+        return p.returncode == 0 and p.stdout.strip() == "yes", marker
+    except (OSError, subprocess.TimeoutExpired):
+        return False, marker
+
+
+class ClockAuthority:
+    """Observe clocks; never set them or promote saved wall time to accurate time."""
+
+    def __init__(self, c):
+        self.path = Path(c["spool"]) / "clock.json"
+        self.previous = None
+        self.blocked = None
+        self.ntp = (False, None)
+        self.next_ntp = 0
+        self.last_save = -math.inf
+        if os.path.lexists(self.path):
+            try:
+                saved = read_regular_json(self.path)
+                if (saved["version"] != 1 or type(saved["elapsed"]) not in (int, float)
+                        or not math.isfinite(saved["elapsed"]) or saved["elapsed"] < 0
+                        or not isinstance(saved["boot_id"], str)
+                        or type(saved["wall"]) not in (int, float) or not math.isfinite(saved["wall"])
+                        or saved.get("status") not in ("synchronized", "uncertain")
+                        or any(saved.get(k) is not None and not isinstance(saved[k], str)
+                               for k in ("ntp_marker", "blocked_marker"))):
+                    raise ValueError("invalid clock state")
+                if saved["boot_id"] == boot_id():
+                    self.previous, self.blocked = saved, saved.get("blocked_marker")
+            except Exception:
+                # Keep corrupt evidence, start uncertain until a new NTP observation.
+                backup = self.path.with_name("clock-invalid-" + uuid.uuid4().hex)
+                os.link(self.path, backup, follow_symlinks=False)
+                self.ntp = ntp_observation()
+                self.blocked = self.ntp[1]
+                LOG.warning("clock state invalid; fresh synchronization required")
+
+    def sample(self):
+        tick = elapsed()
+        if tick >= self.next_ntp:
+            self.ntp = ntp_observation()
+            self.next_ntp = tick + 10
+        tick, wall = elapsed(), time.time()
+        synced, marker = self.ntp
+        previous = self.previous
+        step = bool(previous and (tick < previous["elapsed"] or abs(
+            (wall - previous["wall"]) - (tick - previous["elapsed"])) > 2))
+        if step:
+            self.blocked = previous.get("ntp_marker")
+            # A step often IS NTP correcting the clock. Refresh evidence now.
+            synced, marker = self.ntp = ntp_observation()
+            tick, wall = elapsed(), time.time()
+            self.next_ntp = tick + 10
+        trusted = synced and marker is not None and marker != self.blocked
+        if trusted:
+            self.blocked = None
+        value = dict(version=1, boot_id=boot_id(), elapsed=tick, wall=wall,
+                     observed_utc=dt.datetime.fromtimestamp(wall, UTC).isoformat(),
+                     status="synchronized" if trusted else "uncertain",
+                     ntp_marker=marker, blocked_marker=self.blocked,
+                     reason="clock_step" if step else "ntp_observed" if trusted else "no_fresh_ntp")
+        changed = bool(previous and (step or value["status"] != previous.get("status")))
+        self.previous = value
+        if changed or tick - self.last_save >= 30:
+            atomic_json(self.path, value)
+            self.last_save = tick
+        return value, changed
+
+    def startup(self, seconds=60):
+        deadline = time.monotonic() + min(120, max(0, seconds))
+        while True:
+            value, _ = self.sample()
+            if value["status"] == "synchronized" or STOP.is_set() or time.monotonic() >= deadline:
+                LOG.info("startup clock status=%s; capture wait finished", value["status"])
+                return value
+            STOP.wait(min(1, max(0, deadline - time.monotonic())))
+
+
+class CaptureClock:
+    """Sample independently of slow sealing; persist honest file-open observations."""
+
+    def __init__(self, authority, run, initial, process):
+        self.authority, self.run, self.process = authority, run, process
+        self.previous, self.initial = initial, initial
+        self.last_scan_begin = initial["elapsed"]
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.seen, self.closed = {}, set()
+        self.changed = False
+
+    def scan(self):
+        with self.lock:
+            begin = elapsed()
+            raws = list(self.run.glob("*.mkv"))
+            current, changed = self.authority.sample()
+            self.changed |= changed
+            for raw in raws:
+                if raw in self.closed:
+                    continue
+                if raw not in self.seen:
+                    window = max(0, current["elapsed"] - self.last_scan_begin)
+                    self.seen[raw] = dict(version=1, boot_id=current["boot_id"],
+                        run_id=self.run.name,
+                        observed_start_utc=current["observed_utc"],
+                        open_elapsed=current["elapsed"], observation_window_seconds=window,
+                        status=current["status"] if not self.changed and window <= 5 else "uncertain",
+                        reason="ntp_observed" if current["status"] == "synchronized" and not self.changed
+                               and window <= 5 else "open_uncertain", closed=False)
+                    atomic_json(raw.with_suffix(".clock"), self.seen[raw])
+                if self.changed and self.seen[raw]["status"] != "uncertain":
+                    self.seen[raw].update(status="uncertain", reason="clock_changed")
+                    atomic_json(raw.with_suffix(".clock"), self.seen[raw])
+            self.previous = current
+            self.last_scan_begin = begin
+            if changed:
+                LOG.warning("capture clock changed; closing affected footage with uncertain time")
+                with contextlib.suppress(ProcessLookupError):
+                    self.process.send_signal(signal.SIGINT)
+
+    def watch(self):
+        while not self.done.is_set():
+            try:
+                self.scan()
+            except Exception:
+                # Missing evidence can never become a trustworthy manifest.
+                self.changed = True
+                with contextlib.suppress(ProcessLookupError):
+                    self.process.send_signal(signal.SIGINT)
+                LOG.warning("clock observation failed; closing capture with uncertain time")
+                return
+            self.done.wait(0.5)
+
+    def close(self, raw):
+        self.scan()
+        with self.lock:
+            if raw in self.seen:
+                value = self.seen[raw]
+                value.update(closed=True, close_elapsed=self.previous["elapsed"])
+                atomic_json(raw.with_suffix(".clock"), value)
+            self.closed.add(raw)
+
+
 def syncdir(path):
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -163,6 +352,12 @@ def space_ok(c):
 
 
 def recording_id(raw):
+    match = re.fullmatch(r"([0-9]{10})-(\d{8}T\d{6}Z)", raw.stem)
+    if raw.parent.parent.name == "active" and match:
+        dt.datetime.strptime(match[2], "%Y%m%dT%H%M%SZ")
+        # Identity depends only on an exclusive run directory and increasing index.
+        # The suffix is an opaque session token, NEVER a v2 recording timestamp.
+        return uuid.uuid5(uuid.UUID(hex=raw.parent.name), raw.name).hex + "-" + match[2]
     ident = raw.stem if raw.parent.name == "ready" else raw.parent.name + "-" + raw.stem
     if not re.fullmatch(r"[a-f0-9]{32}-\d{8}T\d{6}Z", ident):
         raise ValueError("invalid recording filename")
@@ -170,20 +365,45 @@ def recording_id(raw):
     return ident
 
 
-def manifest_for(c, raw, ident, reason):
+def capture_metadata(source):
+    path = source.with_suffix(".clock")
+    try:
+        value = read_regular_json(path)
+        if (value.get("version") != 1 or value.get("status") not in ("synchronized", "uncertain")
+                or not isinstance(value.get("boot_id"), str) or type(value.get("closed")) is not bool
+                or any(type(value.get(k)) not in (int, float) or not math.isfinite(value[k]) or value[k] < 0
+                       for k in ("open_elapsed", "observation_window_seconds"))
+                or dt.datetime.fromisoformat(value["observed_start_utc"]).utcoffset() != dt.timedelta()):
+            raise ValueError("invalid capture clock")
+        if not value["closed"]:
+            value = dict(value, status="uncertain", reason="recovered_without_close")
+        return value
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return dict(version=1, status="uncertain", reason="observation_missing", closed=False)
+
+
+def manifest_for(c, raw, ident, reason, source=None):
     if not stat.S_ISREG(raw.lstat().st_mode):
         raise ValueError("not regular media")
     data, duration = probe(raw)
-    start = dt.datetime.strptime(ident.rsplit("-", 1)[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    clock = capture_metadata(source or raw)
+    start = (dt.datetime.fromisoformat(clock["observed_start_utc"])
+             if clock["status"] == "synchronized" else None)
     m = dict(
+        manifest_version=2,
         id=ident,
-        start_utc=start.isoformat(),
-        end_utc=(start + dt.timedelta(seconds=duration)).isoformat(),
+        start_utc=start.isoformat() if start else None,
+        end_utc=(start + dt.timedelta(seconds=duration)).isoformat() if start else None,
         closed_utc=now(),
+        sealed_timer=timer_anchor(),
+        clock=clock,
         duration_seconds=duration,
         timezone=c["timezone"],
         camera=c["camera_name"],
-        timestamp_basis="recorder segment-open UTC clock, one-second precision; end derived from media duration",
+        timestamp_basis=("NTP-observed recorder clock at first file observation; approximate, not camera time; "
+                         "start observation window recorded in clock metadata; end derived from media duration"
+                         if start else "Capture UTC unknown; any recorder clock observation is untrusted; "
+                         "no retrospective timestamp inference"),
         target_seconds=c["segment_seconds"],
         close_reason=reason,
         partial=duration < c["segment_seconds"] - min(10, c["segment_seconds"] * 0.1),
@@ -217,6 +437,19 @@ def seal(c, raw, m):
     ready = Path(c["spool"]) / "ready"
     ready.mkdir(exist_ok=True)
     target = ready / (m["id"] + ".mkv")
+    manifest = target.with_suffix(".json")
+    existing = check_manifest(read_regular_json(manifest)) if os.path.lexists(manifest) else None
+    if existing and any(existing.get(k) != m.get(k) for k in
+                        ("id", "size", "sha256", "start_utc", "end_utc", "clock")):
+        raise ValueError("sealed manifest conflict")
+    # Preserve open/close evidence if interrupted after linking video but before JSON.
+    if m.get("manifest_version") == 2 and not existing:
+        clock_path = target.with_suffix(".clock")
+        try:
+            exclusive_json(clock_path, m["clock"])
+        except FileExistsError:
+            if read_regular_json(clock_path) != m["clock"]:
+                raise ValueError("sealed clock conflict") from None
     with raw.open("rb") as f:
         os.fsync(f.fileno())
     try:
@@ -226,13 +459,14 @@ def seal(c, raw, m):
                 or digest(target) != m["sha256"]):
             raise ValueError("sealed video conflict") from None
     syncdir(ready)
-    manifest = target.with_suffix(".json")
     try:
         exclusive_json(manifest, m)
     except FileExistsError:
         saved = check_manifest(read_regular_json(manifest))
-        if any(saved.get(k) != m[k] for k in ("id", "size", "sha256", "start_utc", "end_utc")):
+        if any(saved.get(k) != m.get(k) for k in ("id", "size", "sha256", "start_utc", "end_utc", "clock")):
             raise ValueError("sealed manifest conflict") from None
+    syncdir(ready)
+    target.with_suffix(".clock").unlink(missing_ok=True)
     syncdir(ready)
 
 
@@ -240,6 +474,7 @@ def finalize(c, raw, reason):
     m = manifest_for(c, raw, recording_id(raw), reason)
     seal(c, raw, m)
     raw.unlink()
+    raw.with_suffix(".clock").unlink(missing_ok=True)
     syncdir(raw.parent)
     LOG.info("sealed recording %s duration=%.1fs", m["id"], m["duration_seconds"])
 
@@ -285,6 +520,8 @@ def load_recovery(path):
                    for k in ("last_attempt", "next_attempt"))
             or not 0 <= s["next_attempt"] - s["last_attempt"] <= 21600):
         raise ValueError("invalid recovery state")
+    if "timer" in s:
+        check_timer(s["timer"])
     return s
 
 
@@ -307,8 +544,17 @@ def recovery_entry(c, entry):
 
 
 @contextlib.contextmanager
-def recovery_run_lock(c, ident):
-    run = Path(c["spool"]) / "active" / ident.split("-", 1)[0]
+def recovery_run_lock(c, ident, entry=None):
+    run_id = ident.split("-", 1)[0]
+    if entry and Path(entry).parts[0] == "active":
+        run_id = Path(entry).parts[1]
+    elif entry:
+        clock_path = (Path(c["spool"]) / entry).with_suffix(".clock")
+        if clock_path.exists():
+            run_id = read_regular_json(clock_path).get("run_id", run_id)
+    if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{32}", run_id):
+        raise ValueError("invalid capture run")
+    run = Path(c["spool"]) / "active" / run_id
     if not run.exists():
         yield
         return
@@ -328,14 +574,20 @@ def recovery_candidates(root):
     for run in (root / "active").iterdir():
         if stat.S_ISDIR(run.lstat().st_mode):
             for raw in run.iterdir():
-                if raw.name not in ("session.json", "capture.lock"):
+                if raw.name not in ("session.json", "capture.lock") and not (
+                        raw.suffix == ".clock" and raw.with_suffix(".mkv").exists()):
                     yield raw.relative_to(root)
         else:
             yield run.relative_to(root)
     for raw in (root / "ready").iterdir():
         if ((raw.suffix == ".mkv" and not os.path.lexists(raw.with_suffix(".json")))
-                or raw.suffix not in (".mkv", ".json")):
-            if raw.suffix == ".mkv" or time.time() - raw.lstat().st_mtime > 300:
+                or raw.suffix not in (".mkv", ".json", ".clock")):
+            observed = root / "recovery" / "discovery" / recovery_key(raw.relative_to(root))
+            if raw.suffix != ".mkv":
+                saved = read_regular_json(observed) if observed.exists() else {}
+                if remaining(observed, saved, 300) > 0:
+                    continue
+            if raw.exists() or raw.is_symlink():
                 yield raw.relative_to(root)
 
 
@@ -368,7 +620,7 @@ def recover_one(c, entry, output_limit):
     resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
     raw, ident = recovery_entry(c, entry)
     state_path = recovery_path(c, entry)
-    with recovery_run_lock(c, ident):
+    with recovery_run_lock(c, ident, entry):
         s = load_recovery(state_path)
         if not s or s["status"] != "running":
             raise ValueError("attempt not reserved")
@@ -394,7 +646,10 @@ def recover_one(c, entry, output_limit):
             fixed = root / "ready" / (ident + ".mkv")
             if raw != fixed and not os.path.samefile(raw, fixed):
                 raise ValueError("sealed video conflict")
-            m = manifest_for(c, fixed, ident, "recovered_after_restart")
+            saved_manifest = fixed.with_suffix(".json")
+            m = (check_manifest(read_regular_json(saved_manifest)) if saved_manifest.exists()
+                 else manifest_for(c, fixed, ident, "recovered_after_restart", source=raw
+                     if raw.with_suffix(".clock").exists() else fixed))
         else:
             fixed = work / ("attempt-" + str(s["attempts"]) + ".mkv")
             result = subprocess.run([
@@ -403,7 +658,7 @@ def recover_one(c, entry, output_limit):
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
             if result.returncode:
                 raise ValueError("remux failed")
-            m = manifest_for(c, fixed, ident, "recovered_after_restart")
+            m = manifest_for(c, fixed, ident, "recovered_after_restart", source=raw)
             with fixed.open("rb") as source:
                 os.fsync(source.fileno())
             syncdir(work)
@@ -420,7 +675,7 @@ def recover(c):
     result = dict(attempted=0, recovered=0, quarantined=0)
     budget = min(240, max(0.1, c.get("recovery_budget_seconds", 240)))
     deadline = time.monotonic() + budget
-    for name in ("active", "ready", "recovery", "recovery/work"):
+    for name in ("active", "ready", "recovery", "recovery/work", "recovery/discovery"):
         directory = root / name
         directory.mkdir(parents=True, exist_ok=True)
         if not stat.S_ISDIR(directory.lstat().st_mode):
@@ -445,11 +700,12 @@ def recover(c):
                            for k in ("last_attempt", "next_attempt"))
                     or not 0 <= saved["next_attempt"] - saved["last_attempt"] <= 300):
                 raise ValueError("invalid recovery pass state")
-            if saved["last_attempt"] <= current < saved["next_attempt"]:
+            if remaining(service, saved, saved["next_attempt"] - saved["last_attempt"]) > 0:
                 return result
         # Persist before scanning/spawning: reconnect, boot or a crash cannot
         # reset the shared five-minute ceiling. Corrupt state requires an operator.
-        atomic_json(service, dict(version=1, last_attempt=current, next_attempt=current + 300))
+        atomic_json(service, dict(version=1, last_attempt=current, next_attempt=current + 300,
+                                  timer=timer_anchor(300)))
         for entry in recovery_candidates(root):
             if STOP.is_set() or time.monotonic() >= deadline or result["attempted"] >= 2:
                 break
@@ -457,7 +713,7 @@ def recover(c):
             try:
                 s = load_recovery(state_path)
                 if s and (s["status"] in ("quarantined", "recovered")
-                          or s["last_attempt"] <= current < s["next_attempt"]):
+                          or remaining(state_path, s, s["next_attempt"] - s["last_attempt"]) > 0):
                     continue
                 attempts = s["attempts"] if s else 0
                 if attempts >= 3:
@@ -465,7 +721,7 @@ def recover(c):
                     continue
                 try:
                     raw, ident = recovery_entry(c, entry)
-                    with recovery_run_lock(c, ident):
+                    with recovery_run_lock(c, ident, entry):
                         pass
                 except BlockingIOError:
                     continue  # Recorder owns the entire run until close/finalize.
@@ -484,6 +740,7 @@ def recover(c):
                 s = dict(version=1, entry=str(entry), attempts=attempts + int(enough),
                          status="running" if enough else "backoff", reason="interrupted" if enough else "space",
                          last_attempt=current, next_attempt=current + min(21600, 300 * 2**min(attempts, 6)))
+                s["timer"] = timer_anchor(s["next_attempt"] - s["last_attempt"])
                 atomic_json(state_path, s)
                 if not enough:
                     LOG.warning("recovery deferred reason=space entry=%s; footage retained", state_path.stem)
@@ -509,6 +766,9 @@ def recover(c):
 
 
 def record_connection(c, url, run):
+    authority = ClockAuthority(c)
+    initial, _ = authority.sample()
+    suffix = dt.datetime.fromtimestamp(initial["wall"], UTC).strftime("%Y%m%dT%H%M%SZ")
     cmd = [
         "ffmpeg",
         "-nostdin",
@@ -536,16 +796,15 @@ def record_connection(c, url, run):
         "-segment_time",
         str(c["segment_seconds"]),
         "-segment_atclocktime",
-        "1",
+        "1" if initial["status"] == "synchronized" else "0",
         "-reset_timestamps",
         "1",
-        "-strftime",
-        "1",
+        "-n",
         "-segment_list",
         "pipe:1",
         "-segment_list_type",
         "csv",
-        str(run / "%Y%m%dT%H%M%SZ.mkv"),
+        str(run / ("%010d-" + suffix + ".mkv")),
     ]
     env = dict(os.environ, TZ="UTC")
     # FFmpeg stderr can contain the credential URL: never forward it to journals.
@@ -556,6 +815,9 @@ def record_connection(c, url, run):
         env=env,
         text=True,
     )
+    observer = CaptureClock(authority, run, initial, p)
+    watcher = threading.Thread(target=observer.watch, daemon=True)
+    watcher.start()
     try:
         events = queue.Queue()
 
@@ -573,7 +835,8 @@ def record_connection(c, url, run):
             while not events.empty():
                 raw = run / Path(events.get()).name
                 try:
-                    finalize(c, raw, "hour_boundary")
+                    observer.close(raw)
+                    finalize(c, raw, "clock_change" if observer.changed else "hour_boundary")
                 except Exception:
                     LOG.warning(
                         "invalid closed segment retained; capture continues"
@@ -584,11 +847,13 @@ def record_connection(c, url, run):
                 last_change = time.monotonic()
             if (
                 STOP.is_set()
+                or observer.changed
                 or not space_ok(c)
                 or time.monotonic() - last_change > 60
             ):
                 reason = (
-                    "shutdown" if STOP.is_set() else "storage_guard_or_stream_stall"
+                    "shutdown" if STOP.is_set() else "clock_change" if observer.changed
+                    else "storage_guard_or_stream_stall"
                 )
                 p.send_signal(signal.SIGINT)
                 try:
@@ -605,6 +870,9 @@ def record_connection(c, url, run):
             raw = run / Path(events.get()).name
             if raw.exists():
                 try:
+                    observer.close(raw)
+                    if observer.changed:
+                        reason = "clock_change"
                     finalize(c, raw, reason)
                 except Exception:
                     LOG.warning("incomplete segment retained for recovery")
@@ -616,6 +884,8 @@ def record_connection(c, url, run):
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.wait(timeout=2)
+        observer.done.set()
+        watcher.join(timeout=5)
         p.stdout.close()
 
 
@@ -628,6 +898,7 @@ def record(c, credentials):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(protocol_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         url = credential_url(credentials)
+        ClockAuthority(c).startup(c.get("startup_sync_wait_seconds", 60))
         while not STOP.is_set():
             if not space_ok(c):
                 LOG.warning("storage guard: recording paused; unverified footage retained")
@@ -640,8 +911,8 @@ def record(c, credentials):
                 fcntl.flock(capture_lock, fcntl.LOCK_EX)
                 atomic_json(run / "session.json", {
                     "started_utc": now(),
-                    "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-                    if Path("/proc/sys/kernel/random/boot_id").exists() else "test",
+                    "boot_id": boot_id(),
+                    "version": 2,
                 })
                 try:
                     record_connection(c, url, run)
@@ -678,16 +949,47 @@ def check_manifest(m):
         raise ValueError("invalid hash")
     if type(m.get("size")) is not int or not 0 < m["size"] <= 8 * 1024**3:
         raise ValueError("invalid size")
+    version = m.get("manifest_version", 1)
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("invalid manifest version")
+    uncertain = False
+    if version == 2:
+        clock = m.get("clock")
+        if (not isinstance(clock, dict) or clock.get("version") != 1
+                or clock.get("status") not in ("synchronized", "uncertain")
+                or clock.get("reason") not in ("ntp_observed", "open_uncertain", "clock_changed",
+                                               "recovered_without_close", "observation_missing")
+                or type(clock.get("closed")) is not bool):
+            raise ValueError("invalid clock metadata")
+        uncertain = clock["status"] == "uncertain"
+        if not uncertain:
+            if (not clock["closed"] or clock["reason"] != "ntp_observed"
+                    or not isinstance(clock.get("boot_id"), str)
+                    or any(type(clock.get(k)) not in (int, float) or not math.isfinite(clock[k]) or clock[k] < 0
+                           for k in ("open_elapsed", "close_elapsed", "observation_window_seconds"))
+                    or clock["close_elapsed"] < clock["open_elapsed"]
+                    or clock["observation_window_seconds"] > 5
+                    or m.get("start_utc") != clock.get("observed_start_utc")):
+                raise ValueError("invalid synchronized observation")
+        check_timer(m["sealed_timer"])
+        if m["sealed_timer"]["delay"] != 0:
+            raise ValueError("invalid seal timer")
     for k in ("start_utc", "end_utc"):
-        if dt.datetime.fromisoformat(m[k]).utcoffset() != dt.timedelta():
+        if uncertain:
+            if m[k] is not None:
+                raise ValueError("uncertain capture must not claim UTC")
+        elif dt.datetime.fromisoformat(m[k]).utcoffset() != dt.timedelta():
             raise ValueError("timestamps must be UTC")
     if "closed_utc" in m and dt.datetime.fromisoformat(m["closed_utc"]).utcoffset() != dt.timedelta():
         raise ValueError("timestamps must be UTC")
-    if dt.datetime.fromisoformat(m["end_utc"]) <= dt.datetime.fromisoformat(m["start_utc"]):
+    if not uncertain and dt.datetime.fromisoformat(m["end_utc"]) <= dt.datetime.fromisoformat(m["start_utc"]):
         raise ValueError("invalid time range")
     duration = m.get("duration_seconds")
     if type(duration) not in (int, float) or not 0 < duration < 172800:
         raise ValueError("invalid duration")
+    if version == 2 and not uncertain and abs((dt.datetime.fromisoformat(m["end_utc"])
+            - dt.datetime.fromisoformat(m["start_utc"])).total_seconds() - duration) > 0.00001:
+        raise ValueError("inconsistent media-derived end")
     if not all(isinstance(m.get(k), str) for k in ("timestamp_basis", "close_reason")):
         raise ValueError("invalid metadata")
     return m
@@ -703,9 +1005,25 @@ def check_saved_receipt(saved, m):
     if not isinstance(saved, dict) or not receipt_matches(saved.get("receipt"), m):
         raise ItemFailure("receipt_invalid")
     verified = saved.get("verified_at")
-    if type(verified) not in (int, float) or not math.isfinite(verified) or verified < 0:
+    if (type(verified) not in (int, float) or not math.isfinite(verified)
+            or verified < 0 and "timer" not in saved):
         raise ItemFailure("receipt_invalid")
+    if "timer" in saved:
+        check_timer(saved["timer"])
     return saved
+
+
+def archive_calendar(c, m):
+    """Arrival time/server wall time must never stand in for capture time."""
+    if m["start_utc"] is None:
+        return None
+    local = dt.datetime.fromisoformat(m["start_utc"]).astimezone(ZoneInfo(c["timezone"]))
+    if m.get("manifest_version") == 2:
+        earliest = (dt.datetime.fromisoformat(m["start_utc"]) - dt.timedelta(
+            seconds=m["clock"]["observation_window_seconds"])).astimezone(ZoneInfo(c["timezone"]))
+        if (earliest.year, earliest.month) != (local.year, local.month):
+            return None  # The observed open window crosses a calendar boundary.
+    return local
 
 
 def receive(c, input_stream=sys.stdin.buffer):
@@ -764,13 +1082,14 @@ def receive(c, input_stream=sys.stdin.buffer):
                 return
             if req.get("action") != "upload":
                 raise ItemFailure("remote_rejected")
-            local = dt.datetime.fromisoformat(m["start_utc"]).astimezone(
-                ZoneInfo(c["timezone"])
-            )
+            local = archive_calendar(c, m)
             year, month = map(int, c["season_epoch"].split("-"))
-            season = (local.year - year) * 12 + local.month - month + 1
-            if not 1 <= season <= 9999:
-                raise ItemFailure("remote_rejected")
+            season = (local.year - year) * 12 + local.month - month + 1 if local else 0
+            if local and not 1 <= season <= 9999:
+                if m.get("manifest_version") == 2:
+                    local, season = None, 0
+                else:
+                    raise ItemFailure("remote_rejected")
             if row:
                 episode = row[3]
             else:
@@ -785,7 +1104,7 @@ def receive(c, input_stream=sys.stdin.buffer):
             stem = "Recording - S%02dE%02d - %s - %s" % (
                 season,
                 episode,
-                local.strftime("%Y-%m-%d %H-%M-%S"),
+                local.strftime("%Y-%m-%d %H-%M-%S") if local else "Time uncertain",
                 m["id"][:8],
             )
             video = season_dir / (stem + ".mkv")
@@ -820,30 +1139,35 @@ def receive(c, input_stream=sys.stdin.buffer):
                 raise ItemFailure("remote_rejected") from None
             if abs(duration - m["duration_seconds"]) > 2:
                 raise ItemFailure("remote_rejected")
-            title = (
-                local.strftime("%Y-%m-%d %H:%M:%S")
+            title = (("~ " if m.get("manifest_version") == 2 else "")
+                + local.strftime("%Y-%m-%d %H:%M:%S")
                 + " – "
                 + dt.datetime.fromisoformat(m["end_utc"])
                 .astimezone(ZoneInfo(c["timezone"]))
                 .strftime("%H:%M:%S %z")
-            )
+            ) if local else "Recording time uncertain – " + m["id"][:8]
             if m.get("partial"):
                 title += " [partial]"
             if m.get("target_seconds", 3600) != 3600:
                 title += " [validation]"
             atomic_json(temp_video.with_suffix(".json"), m)
+            details = dict(
+                    title=title, showtitle=c["show_title"], season=season, episode=episode,
+                    plot=(f"Approximate recorder observation {m['start_utc']} to {m['end_utc']}. "
+                          if local and m.get("manifest_version") == 2 else
+                          f"Recorded {m['start_utc']} to {m['end_utc']} UTC. " if local else
+                          "Capture date/season uncertain; no accurate capture UTC assigned. ")
+                         + f"{m['timestamp_basis']}. Close reason: {m['close_reason']}.",
+                    lockdata="false")
+            if local:
+                earliest = (dt.datetime.fromisoformat(m["start_utc"]) - dt.timedelta(seconds=
+                    m.get("clock", {}).get("observation_window_seconds", 0))).astimezone(ZoneInfo(c["timezone"]))
+                if earliest.date() == local.date():
+                    details["aired"] = local.strftime("%Y-%m-%d")
             xml_file(
                 temp_video.with_suffix(".nfo"),
                 "episodedetails",
-                dict(
-                    title=title,
-                    showtitle=c["show_title"],
-                    season=season,
-                    episode=episode,
-                    aired=local.strftime("%Y-%m-%d"),
-                    plot=f"Recorded {m['start_utc']} to {m['end_utc']} UTC. {m['timestamp_basis']}. Close reason: {m['close_reason']}.",
-                    lockdata="false",
-                ),
+                details,
             )
             xml_file(
                 base / "tvshow.nfo",
@@ -858,7 +1182,8 @@ def receive(c, input_stream=sys.stdin.buffer):
                 season_dir / "season.nfo",
                 "season",
                 dict(
-                    title=local.strftime("%B %Y"), seasonnumber=season, lockdata="false"
+                    title=local.strftime("%B %Y") if local else "Time uncertain",
+                    seasonnumber=season, lockdata="false"
                 ),
             )
             syncdir(stage)
@@ -986,20 +1311,22 @@ def load_retry(path):
             raise ValueError("invalid retry time")
     if not 0 <= state["next_attempt"] - state["last_attempt"] <= 3600:
         raise ValueError("invalid retry delay")
+    if "timer" in state:
+        check_timer(state["timer"])
     return state
 
 
-def retry_due(state, signature, current):
-    # Repairs are noticed promptly. A clock reversal cannot defer work forever.
-    return (state is None or state["signature"] != signature
-            or current >= state["next_attempt"] or current < state["last_attempt"])
+def retry_due(state, signature, path):
+    return (state is None or state["signature"] != signature or
+            remaining(path, state, state["next_attempt"] - state["last_attempt"]) <= 0)
 
 
 def defer(path, state, signature, reason, current, maximum=3600):
     failures = (state["failures"] if state and state["signature"] == signature else 0) + 1
     delay = min(maximum, 60 * 2 ** min(failures - 1, 6))
     atomic_json(path, dict(version=1, failures=failures, signature=signature,
-                           reason=reason, last_attempt=current, next_attempt=current + delay))
+                           reason=reason, last_attempt=current, next_attempt=current + delay,
+                           timer=timer_anchor(delay)))
     LOG.warning("publication deferred reason=%s entry=%s retry_seconds=%d; footage retained",
                 reason, path.stem, delay)
 
@@ -1055,7 +1382,7 @@ def publish_item(c, manifest, m, receipts, network_ready):
     if not network_ready:
         return False
     if saved:
-        if time.time() - saved["verified_at"] < c["grace_seconds"] and space_ok(c):
+        if space_ok(c) and remaining(rec, saved, c["grace_seconds"]) > 0:
             return "local"
         ack = remote(c, m, "verify")  # Fresh remote rehash and sidecar checks.
         if not receipt_matches(ack, m):
@@ -1071,7 +1398,7 @@ def publish_item(c, manifest, m, receipts, network_ready):
     ack = remote(c, m, "upload", video)
     if not receipt_matches(ack, m):
         raise ItemFailure("remote_receipt_invalid")
-    atomic_json(rec, dict(receipt=ack, verified_at=time.time()))
+    atomic_json(rec, dict(receipt=ack, verified_at=time.time(), timer=timer_anchor(c["grace_seconds"])))
     LOG.info("server copy verified %s", m["id"])
     return "remote"
 
@@ -1097,7 +1424,7 @@ def publish_once(c):
                               or service_state["signature"] != "service"
                               or service_state["next_attempt"] - service_state["last_attempt"] > 300):
             raise ValueError("invalid service retry state")
-        network_ready = retry_due(service_state, "service", current)
+        network_ready = retry_due(service_state, "service", service_path)
     except Exception:
         # This controls scheduling only, never integrity/deletion authorization.
         # Do not let damaged shared metadata become a permanent queue blocker.
@@ -1111,12 +1438,12 @@ def publish_once(c):
         try:
             signature = queue_signature(manifest, receipts)
             state = load_retry(state_path)
-            if not retry_due(state, signature, current):
+            if not retry_due(state, signature, state_path):
                 continue
             m = check_manifest(read_regular_json(manifest))
             if manifest.stem != m["id"]:
                 raise ValueError("manifest filename mismatch")
-            entries.append((dt.datetime.fromisoformat(m["start_utc"]), manifest, m, state, signature))
+            entries.append((m.get("start_utc") or "", manifest, m, state, signature))
         except Exception:
             try:
                 # Keep a corrupt retry file for diagnosis instead of silently resetting it.

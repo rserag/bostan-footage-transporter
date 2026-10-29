@@ -3,6 +3,7 @@
   "camera_name": "My camera",
   "timezone": "UTC",
   "segment_seconds": 3600,
+  "startup_sync_wait_seconds": 60,
   "reserve_bytes": 2147483648,
   "max_spool_bytes": 8589934592,
   "grace_seconds": 7200,
