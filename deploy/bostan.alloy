@@ -1,0 +1,14 @@
+// Append to an existing Alloy configuration; adapt forward_to to your pipeline.
+// No additional network listener or broad textfile-directory write access.
+prometheus.exporter.unix "bostan" {
+  set_collectors = ["textfile"]
+  textfile {
+    directory = "/var/lib/bostan-monitor-metrics"
+  }
+}
+
+prometheus.scrape "bostan" {
+  targets         = prometheus.exporter.unix.bostan.targets
+  scrape_interval = "60s"
+  forward_to      = [prometheus.relabel.padval.receiver]
+}

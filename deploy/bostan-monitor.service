@@ -1,0 +1,26 @@
+[Unit]
+Description=Bostan external recording and delivery checks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bostan-monitor
+Group=bostan-monitor
+ExecStart=/usr/bin/python3 /opt/bostan/bostan_monitor.py collect --config /etc/bostan/monitor.json
+TimeoutStartSec=90
+StateDirectory=bostan-monitor
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+ReadWritePaths=/var/lib/bostan-monitor /var/lib/bostan-monitor-metrics

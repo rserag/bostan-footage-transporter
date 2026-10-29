@@ -113,11 +113,18 @@ until an operator repairs or quarantines it. Recorder FFmpeg stderr is suppresse
 because it may contain the credential URL; journals contain only generic capture
 status. Do not publish raw process listings or credential files.
 
+Optional [external monitoring](docs/monitoring.md) checks Pi/VPN reachability,
+footage growth and segment closure, the unacknowledged upload queue, remaining
+buffer, committed archive assets and Jellyfin indexing. An independent host
+polls restricted read-only probes once per minute and sends deduplicated
+failure/recovery messages. A Grafana Cloud freshness rule covers the monitor
+itself and missing telemetry. No exporter daemon is added to the Pi.
+
 ## Test
 
 ```sh
 python3 -m unittest discover -s tests -v
-bash -n deploy/install.sh
+bash -n deploy/install.sh deploy/install-monitor.sh
 ```
 
 Tests exercise real FFmpeg-generated H.264/audio media, interrupted transfer,

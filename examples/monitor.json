@@ -1,0 +1,27 @@
+{
+  "pi": {
+    "destination": "bostan-monitor@recorder.example",
+    "port": 22,
+    "ssh_key": "/etc/bostan-monitor/id_ed25519",
+    "known_hosts": "/etc/bostan-monitor/known_hosts"
+  },
+  "server": {
+    "destination": "bostan-monitor@media-server.example",
+    "port": 22,
+    "ssh_key": "/etc/bostan-monitor/id_ed25519",
+    "known_hosts": "/etc/bostan-monitor/known_hosts"
+  },
+  "jellyfin": {
+    "url": "http://media-server.example:8096",
+    "series_id": "YOUR_SERIES_ID",
+    "library_root": "/media/tv/My camera",
+    "key_file": "/etc/bostan-monitor/jellyfin-api-key"
+  },
+  "telegram": {
+    "token_file": "/etc/bostan-monitor/telegram-token",
+    "chat_id_file": "/etc/bostan-monitor/telegram-chat-id"
+  },
+  "fallback_bytes_per_second": 100000,
+  "state_file": "/var/lib/bostan-monitor/state.json",
+  "metrics_file": "/var/lib/bostan-monitor-metrics/bostan.prom"
+}

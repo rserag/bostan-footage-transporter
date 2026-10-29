@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Bostan once a minute from outside the recorder
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=bostan-monitor.service
+
+[Install]
+WantedBy=timers.target
