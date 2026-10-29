@@ -102,6 +102,16 @@ def probe_pi(c, clock=time.time, services=service_status):
     for path, stat in regular_files(root, "ready/*.json"):
         try:
             m = load(path)
+            if (not isinstance(m, dict) or path.stem != m["id"]
+                    or not re.fullmatch(r"[a-f0-9]{32}-\d{8}T\d{6}Z", m["id"])
+                    or not re.fullmatch(r"[a-f0-9]{64}", m["sha256"])
+                    or type(m["size"]) is not int or m["size"] <= 0
+                    or type(m["duration_seconds"]) not in (int, float)
+                    or not 0 < m["duration_seconds"] < 172800):
+                raise ValueError("invalid manifest")
+            start, end = timestamp(m["start_utc"]), timestamp(m["end_utc"])
+            if end <= start:
+                raise ValueError("invalid time range")
             closed = timestamp(m["closed_utc"])
             closes.append(closed)
             if m["duration_seconds"] > 10:
@@ -109,21 +119,59 @@ def probe_pi(c, clock=time.time, services=service_status):
             receipt = root / "receipts" / path.name
             acknowledged = False
             if receipt.exists():
-                saved = load(receipt)["receipt"]
-                acknowledged = (saved.get("status") == "committed" and all(
+                record = load(receipt)
+                saved = record["receipt"]
+                verified = record["verified_at"]
+                acknowledged = (type(verified) in (int, float) and math.isfinite(verified)
+                    and verified >= 0 and isinstance(saved, dict)
+                    and type(saved.get("size")) is int and saved.get("status") == "committed" and all(
                     saved.get(k) == m[k] for k in ("id", "size", "sha256")))
                 if not acknowledged:
                     invalid += 1
+            video = path.with_suffix(".mkv")
+            if not acknowledged and (not video.is_file() or video.is_symlink()
+                                     or video.stat().st_size != m["size"]):
+                invalid += 1
             if not acknowledged:
                 pending.append((closed, m["size"]))
         except FileNotFoundError:
             # Atomic cleanup may remove the manifest between listing and read.
             continue
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             invalid += 1
     for path, stat in regular_files(root, "receipts/*.json"):
         try:
-            closes.append(float(load(path)["verified_at"]))
+            record = load(path)
+            verified = record["verified_at"]
+            receipt = record["receipt"]
+            if (not isinstance(receipt, dict) or receipt.get("status") != "committed"
+                    or receipt["id"] != path.stem
+                    or not re.fullmatch(r"[a-f0-9]{32}-\d{8}T\d{6}Z", receipt["id"])
+                    or not re.fullmatch(r"[a-f0-9]{64}", receipt["sha256"])
+                    or type(receipt["size"]) is not int or receipt["size"] <= 0):
+                raise ValueError("invalid receipt")
+            if type(verified) not in (int, float) or not math.isfinite(verified) or verified < 0:
+                raise ValueError("invalid receipt time")
+            closes.append(verified)
+        except FileNotFoundError:
+            continue
+        except (ValueError, KeyError, TypeError):
+            invalid += 1
+    # Failed items remain in ready/ and in capacity accounting. Their durable
+    # retry marker also exposes hash/remote failures invisible to a cheap probe.
+    for path, stat in regular_files(root, "retry/*.json"):
+        try:
+            retry = load(path)
+            if (path.name != "service.json" or retry["version"] != 1
+                    or retry["reason"] != "service_unavailable"
+                    or retry["signature"] != "service"
+                    or type(retry["failures"]) is not int or retry["failures"] < 1
+                    or type(retry["next_attempt"]) not in (int, float)
+                    or type(retry["last_attempt"]) not in (int, float)
+                    or not math.isfinite(retry["next_attempt"])
+                    or not math.isfinite(retry["last_attempt"])
+                    or not 0 <= retry["next_attempt"] - retry["last_attempt"] <= 300):
+                invalid += 1
         except FileNotFoundError:
             continue
         except (ValueError, KeyError, TypeError):

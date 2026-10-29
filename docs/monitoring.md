@@ -47,6 +47,14 @@ the median bitrate of the six newest available closed segments. Configure the
 fallback from measured traffic. This conservative estimate is not a guaranteed
 outage duration or a prediction of future bitrate.
 
+The publisher's [durable item retries](upload-retries.md) keep failed footage in
+`ready/`. Item retry markers also count as invalid queue entries, exposing local
+hash and remote verification failures without hashing videos in the probe.
+Malformed/missing video or receipt metadata remains visible. Shared service
+backoff uses existing reachability/backlog checks rather than falsely labeling
+every queued recording corrupt. Retry and held-file bytes stay in the buffer
+estimate; publisher changes do not reset the collector's incident state.
+
 The server probes every committed receipt row. A ledger at
 `state/intentional-deletions.json` can exclude IDs explicitly marked
 `{"status":"deleted"}`. Planned/pending entries are not exclusions. Monitoring

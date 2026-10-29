@@ -201,12 +201,14 @@ class MonitorTests(unittest.TestCase):
             active = root / "active/run/20270115T070000Z.mkv"
             active.write_bytes(b"a" * 20)
             os.utime(active, (NOW, NOW))
-            manifest = dict(id="acked", size=10, sha256="abc", duration_seconds=100,
+            ident = "a" * 32 + "-20270115T065820Z"
+            manifest = dict(id=ident, size=10, sha256="a" * 64, duration_seconds=100,
+                            start_utc="2027-01-15T06:58:20+00:00", end_utc="2027-01-15T07:00:00+00:00",
                             closed_utc="2027-01-15T07:00:00+00:00")
-            (root / "ready/acked.json").write_text(json.dumps(manifest))
-            (root / "ready/acked.mkv").write_bytes(b"b" * 10)
-            (root / "receipts/acked.json").write_text(json.dumps(dict(
-                receipt=dict(status="committed", id="acked", size=10, sha256="abc"), verified_at=NOW - 100)))
+            (root / "ready" / (ident + ".json")).write_text(json.dumps(manifest))
+            (root / "ready" / (ident + ".mkv")).write_bytes(b"b" * 10)
+            (root / "receipts" / (ident + ".json")).write_text(json.dumps(dict(
+                receipt=dict(status="committed", id=ident, size=10, sha256="a" * 64), verified_at=NOW - 100)))
             (root / "ready/bad.json").write_text('{"camera":"rtsp://PRIVATE_SENTINEL"}')
             data = monitor.probe_pi(dict(spool=tmp, segment_seconds=3600, reserve_bytes=1,
                                          max_spool_bytes=1000000), clock=lambda: NOW, services=lambda u: 1)
@@ -215,6 +217,49 @@ class MonitorTests(unittest.TestCase):
             self.assertNotIn("PRIVATE_SENTINEL", json.dumps(data))
             self.assertNotIn(tmp, json.dumps(data))
             self.assertEqual(data["active_bytes"], 20)
+
+    def test_deferred_items_remain_visible_and_reduce_available_buffer(self):
+        core_spec = importlib.util.spec_from_file_location("queue_core", Path(monitor.__file__).with_name("bostan.py"))
+        core = importlib.util.module_from_spec(core_spec)
+        core_spec.loader.exec_module(core)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ready").mkdir()
+            ident = "a" * 32 + "-20270115T065820Z"
+            manifest = dict(id=ident, size=1024, sha256="a" * 64, duration_seconds=100,
+                            start_utc="2027-01-15T06:58:20+00:00", end_utc="2027-01-15T07:00:00+00:00",
+                            closed_utc="2027-01-15T07:00:00+00:00", timestamp_basis="test", close_reason="test")
+            path = root / "ready" / (ident + ".json")
+            path.write_text(json.dumps(manifest))
+            path.with_suffix(".mkv").write_bytes(b"x" * 1024)
+            config = dict(spool=tmp, segment_seconds=3600, reserve_bytes=0, max_spool_bytes=1000000,
+                          grace_seconds=7200)
+            with patch.object(core.time, "time", return_value=NOW), patch.object(core, "remote") as remote:
+                core.publish_once(config)
+            remote.assert_not_called()
+            before = monitor.probe_pi(config, clock=lambda: NOW, services=lambda u: 1)
+            self.assertEqual(before["pending_count"], 1)
+            self.assertEqual(before["invalid_entries"], 1)
+            self.assertGreaterEqual(before["spool_bytes"], 1024 + path.stat().st_size)
+            conditions, metrics = self.evaluate(pi=before)
+            self.assertTrue(conditions["queue_invalid"])
+            self.assertEqual(metrics["pi_buffer_bytes"], 1000000 - before["spool_bytes"])
+            # Shared network outages are not mislabeled as corrupt recordings.
+            core.clear_retry(core.retry_path(root, path))
+            core.defer(root / "retry/service.json", None, "service", "service_unavailable", NOW, maximum=300)
+            self.assertEqual(monitor.probe_pi(config, clock=lambda: NOW, services=lambda u: 1)["invalid_entries"], 0)
+            # Missing local footage with no receipt, bad receipt times and bad
+            # start times are visible even before the publisher sees them.
+            path.with_suffix(".mkv").unlink()
+            self.assertGreater(monitor.probe_pi(config, clock=lambda: NOW, services=lambda u: 1)["invalid_entries"], 0)
+            (root / "receipts" / path.name).write_text(json.dumps(dict(receipt=dict(manifest, status="committed"),
+                                                                     verified_at=float("nan"))))
+            self.assertGreater(monitor.probe_pi(config, clock=lambda: NOW, services=lambda u: 1)["invalid_entries"], 0)
+            manifest["start_utc"] = "bad"
+            path.write_text(json.dumps(manifest))
+            data = monitor.probe_pi(config, clock=lambda: NOW, services=lambda u: 1)
+            self.assertGreater(data["invalid_entries"], 0)
+            self.assertNotIn(tmp, json.dumps(data))
 
     def test_server_probe_is_read_only_and_honors_only_deleted_status(self):
         with tempfile.TemporaryDirectory() as tmp:

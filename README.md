@@ -25,6 +25,9 @@ ARMv6 Pi Zero W: video and audio are copied without re-encoding.
   must be on the same filesystem. Interrupted transfers retry from the beginning.
 - Duplicate delivery is idempotent. Monthly seasons and sequential episode
   numbers are reserved in SQLite; each recording ID remains stable on retry.
+- One damaged manifest, recording or receipt does not block later recordings.
+  Failed items stay in place with durable, capped retry backoff; a separate
+  shared backoff limits attempts during network/server outages.
 - Local deletion requires the matching receipt, the retention grace period
   (default two hours), and a fresh remote rehash plus intact manifest/NFO.
   Under storage pressure, already verified files can be removed sooner.
@@ -108,8 +111,9 @@ Back up server media and state together; RAID and checksums do not replace an
 independent backup. No server-side retention/deletion policy is applied.
 
 If uploads are deferred, inspect connectivity, disk capacity and the receiver.
-If one recording is corrupt, it is retained and publication stops at that entry
-until an operator repairs or quarantines it. Recorder FFmpeg stderr is suppressed
+If one recording is corrupt, it is retained while healthy later items continue.
+See [upload retries and repair](docs/upload-retries.md) for the durable retry
+state, outage behavior and operator recovery. Recorder FFmpeg stderr is suppressed
 because it may contain the credential URL; journals contain only generic capture
 status. Do not publish raw process listings or credential files.
 
