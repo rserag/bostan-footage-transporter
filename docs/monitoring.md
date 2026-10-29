@@ -55,6 +55,10 @@ backoff uses existing reachability/backlog checks rather than falsely labeling
 every queued recording corrupt. Retry and held-file bytes stay in the buffer
 estimate; publisher changes do not reset the collector's incident state.
 
+Queue metadata reads are limited to 64 KiB and reject non-regular files, so a
+damaged entry cannot block a probe on a pipe or cause an unbounded read. A bad
+receipt leaves its valid manifest counted as pending as well as invalid.
+
 The server probes every committed receipt row. A ledger at
 `state/intentional-deletions.json` can exclude IDs explicitly marked
 `{"status":"deleted"}`. Planned/pending entries are not exclusions. Monitoring

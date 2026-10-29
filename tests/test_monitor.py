@@ -261,6 +261,35 @@ class MonitorTests(unittest.TestCase):
             self.assertGreater(data["invalid_entries"], 0)
             self.assertNotIn(tmp, json.dumps(data))
 
+    def test_queue_probe_bounds_metadata_and_rejects_fifo_receipt_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ready").mkdir()
+            (root / "receipts").mkdir()
+            oversized = root / "ready/oversized.json"
+            oversized.write_text(" " * 65536 + "{}")
+            with self.assertRaises(ValueError):
+                monitor.load_queue_json(oversized)
+            ident = "a" * 32 + "-20270115T065820Z"
+            manifest = dict(id=ident, size=10, sha256="a" * 64, duration_seconds=100,
+                            start_utc="2027-01-15T06:58:20+00:00", end_utc="2027-01-15T07:00:00+00:00",
+                            closed_utc="2027-01-15T07:00:00+00:00")
+            (root / "ready" / (ident + ".json")).write_text(json.dumps(manifest))
+            (root / "ready" / (ident + ".mkv")).write_bytes(b"b" * 10)
+            os.mkfifo(root / "receipts" / (ident + ".json"))
+            config = root / "config.json"
+            config.write_text(json.dumps(dict(spool=tmp, segment_seconds=3600, reserve_bytes=0,
+                                             max_spool_bytes=1000000)))
+            code = ("import json,runpy,sys; m=runpy.run_path(sys.argv[1]); "
+                    "print(json.dumps(m['probe_pi'](m['load'](sys.argv[2]),services=lambda unit:1)))")
+            result = subprocess.run([sys.executable, "-c", code, str(Path(monitor.__file__)), str(config)],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertGreaterEqual(data["invalid_entries"], 2)
+            self.assertEqual(data["active_bytes"], 0)
+            self.assertEqual(data["pending_count"], 1)
+
     def test_server_probe_is_read_only_and_honors_only_deleted_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

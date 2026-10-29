@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import statistics
 import subprocess
 import sys
@@ -39,6 +40,17 @@ def token(value):
 
 def load(path):
     return json.loads(Path(path).read_text())
+
+
+def load_queue_json(path):
+    """A damaged queue entry must not exhaust or block the read-only probe."""
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError("invalid queue metadata file")
+    with path.open("rb") as source:
+        data = source.read(65537)
+    if len(data) > 65536:
+        raise ValueError("oversize queue metadata")
+    return json.loads(data)
 
 
 def atomic_write(path, text, mode=0o600):
@@ -99,9 +111,9 @@ def probe_pi(c, clock=time.time, services=service_status):
     latest = max(active, key=lambda entry: entry[1].st_mtime, default=None)
     pending, rates, closes = [], [], []
     invalid = 0
-    for path, stat in regular_files(root, "ready/*.json"):
+    for path in (root / "ready").glob("*.json"):
         try:
-            m = load(path)
+            m = load_queue_json(path)
             if (not isinstance(m, dict) or path.stem != m["id"]
                     or not re.fullmatch(r"[a-f0-9]{32}-\d{8}T\d{6}Z", m["id"])
                     or not re.fullmatch(r"[a-f0-9]{64}", m["sha256"])
@@ -118,14 +130,17 @@ def probe_pi(c, clock=time.time, services=service_status):
                 rates.append((closed, m["size"] / m["duration_seconds"]))
             receipt = root / "receipts" / path.name
             acknowledged = False
-            if receipt.exists():
-                record = load(receipt)
-                saved = record["receipt"]
-                verified = record["verified_at"]
-                acknowledged = (type(verified) in (int, float) and math.isfinite(verified)
-                    and verified >= 0 and isinstance(saved, dict)
-                    and type(saved.get("size")) is int and saved.get("status") == "committed" and all(
-                    saved.get(k) == m[k] for k in ("id", "size", "sha256")))
+            if receipt.exists() or receipt.is_symlink():
+                try:
+                    record = load_queue_json(receipt)
+                    saved = record["receipt"]
+                    verified = record["verified_at"]
+                    acknowledged = (type(verified) in (int, float) and math.isfinite(verified)
+                        and verified >= 0 and isinstance(saved, dict)
+                        and type(saved.get("size")) is int and saved.get("status") == "committed" and all(
+                        saved.get(k) == m[k] for k in ("id", "size", "sha256")))
+                except (ValueError, KeyError, TypeError, OSError):
+                    pass
                 if not acknowledged:
                     invalid += 1
             video = path.with_suffix(".mkv")
@@ -137,11 +152,11 @@ def probe_pi(c, clock=time.time, services=service_status):
         except FileNotFoundError:
             # Atomic cleanup may remove the manifest between listing and read.
             continue
-        except (ValueError, KeyError, TypeError, OverflowError):
+        except (ValueError, KeyError, TypeError, OverflowError, OSError):
             invalid += 1
-    for path, stat in regular_files(root, "receipts/*.json"):
+    for path in (root / "receipts").glob("*.json"):
         try:
-            record = load(path)
+            record = load_queue_json(path)
             verified = record["verified_at"]
             receipt = record["receipt"]
             if (not isinstance(receipt, dict) or receipt.get("status") != "committed"
@@ -155,13 +170,13 @@ def probe_pi(c, clock=time.time, services=service_status):
             closes.append(verified)
         except FileNotFoundError:
             continue
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OSError):
             invalid += 1
     # Failed items remain in ready/ and in capacity accounting. Their durable
     # retry marker also exposes hash/remote failures invisible to a cheap probe.
-    for path, stat in regular_files(root, "retry/*.json"):
+    for path in (root / "retry").glob("*.json"):
         try:
-            retry = load(path)
+            retry = load_queue_json(path)
             if (path.name != "service.json" or retry["version"] != 1
                     or retry["reason"] != "service_unavailable"
                     or retry["signature"] != "service"
@@ -174,7 +189,7 @@ def probe_pi(c, clock=time.time, services=service_status):
                 invalid += 1
         except FileNotFoundError:
             continue
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OSError):
             invalid += 1
     orphan = sum(1 for p, s in ready
                  if current - s.st_mtime > 300 and not p.with_suffix(".json").exists())
