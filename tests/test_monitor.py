@@ -31,6 +31,21 @@ def server_sample():
 
 
 class MonitorTests(unittest.TestCase):
+    def test_missing_probe_cannot_clear_existing_clock_skew_incident(self):
+        state = {}
+        monitor.advance(state, {"clock_skew": True}, NOW)
+        monitor.advance(state, {"clock_skew": True}, NOW + 120)
+        self.assertTrue(state["alarms"]["clock_skew"]["active"])
+        for elapsed in (121, 300, 500):
+            server = server_sample()
+            server["timestamp"] = NOW + elapsed
+            conditions, _ = monitor.evaluate({}, state, None, server, {"indexed"}, NOW + elapsed)
+            self.assertIsNone(conditions["clock_skew"])
+            monitor.advance(state, conditions, NOW + elapsed)
+            self.assertTrue(state["alarms"]["clock_skew"]["active"])
+        server["timestamp"] = NOW - 200
+        self.assertTrue(monitor.evaluate({}, state, None, server, {"indexed"}, NOW)[0]["clock_skew"])
+
     def evaluate(self, pi=None, server=None, indexed=None, state=None, current=NOW):
         return monitor.evaluate({}, state if state is not None else {},
                                 pi if pi is not None else pi_sample(),

@@ -529,7 +529,9 @@ def evaluate(c, state, pi, server, indexed, current):
                           and server["timestamp"] - entry["published"] > 600)
             conditions["jellyfin_missing"] = missing > 0
             metrics["jellyfin_missing_count"] = missing
-    conditions["clock_skew"] = max(offsets) > 120 if offsets else None
+    # One bad observed clock is evidence; a missing clock cannot prove recovery.
+    conditions["clock_skew"] = (True if any(offset > 120 for offset in offsets) else
+                                None if pi is None or server is None else False)
     return conditions, metrics
 
 
