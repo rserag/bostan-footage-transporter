@@ -287,7 +287,13 @@ def record(c, credentials):
             reason = "hour_boundary"
             while p.poll() is None:
                 while not events.empty():
-                    finalize(c, run / Path(events.get()).name, "hour_boundary")
+                    raw = run / Path(events.get()).name
+                    try:
+                        finalize(c, raw, "hour_boundary")
+                    except (ValueError, FileNotFoundError, subprocess.TimeoutExpired):
+                        LOG.warning(
+                            "invalid closed segment retained; capture continues"
+                        )
                 size = sum(f.stat().st_size for f in run.glob("*.mkv"))
                 if size != last_size:
                     last_size = size
